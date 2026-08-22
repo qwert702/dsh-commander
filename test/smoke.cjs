@@ -753,13 +753,31 @@ async function clientTests() {
   if (taskG.status !== 'done' || !taskG.detail.includes('G结果')) throw new Error('G settle misattributed: ' + taskG.detail);
   console.log('OK: same-worker tasks serialize with fresh baselines — receipts attributed correctly');
 
-  // --- engine flow I: cross-commander hop guard ---
+  // --- engine flow I: cross-commander hops — budget consumed on success, blocked at cap ---
   eventHandlers['c-2'] = () => ({ ok: true, sessionId: 'c-2', events: [], humanMessages: 0, lastSeq: 5, lastAssistantSeq: 5, lastEnd: null });
+  addFace('c-2');
   await client.activate('c-2'); // roster of BOTH commanders now includes each other
   record = client.state.commanders.get('c-1');
   record.lastBatchAt = 0;
-  record.commanderHops = 99; // exhaust the budget deterministically
-  c1Events.push({ seq: 190, time: 21, turn: 11, text: '<dsh-dispatch target="#1">跨指挥官任务</dsh-dispatch>' });
+  record.commanderHops = 0; // budget available
+  c1Events.push({ seq: 185, time: 20, turn: 11, text: '<dsh-dispatch target="#1">跨派任务</dsh-dispatch>' }); // '#1' = c-2
+  c1LastSeq = 186;
+  c1LastAssistantSeq = 185;
+  await client.poll();
+  const hopOk = [...client.state.tasks.values()].find((t) => t.excerpt === '跨派任务');
+  if (hopOk === undefined || hopOk.status !== 'running' || hopOk.workerId !== 'c-2') {
+    throw new Error('hop success wrong: ' + JSON.stringify(hopOk ?? null));
+  }
+  if (record.commanderHops !== 1) throw new Error('hop budget not consumed: ' + record.commanderHops);
+  if (!calls.prompts.some((p) => p.id === 'c-2' && p.content[0].text === '跨派任务')) throw new Error('hopped prompt missing');
+  // Settle the hop so later flows start clean.
+  hopOk.sentAt = Date.now() - 10000;
+  await client.poll();
+  if (hopOk.status !== 'done') throw new Error('hop settle wrong: ' + hopOk.status);
+  // Exhaust the budget; further cross-commander dispatch must be rejected.
+  record.lastBatchAt = 0;
+  record.commanderHops = 99;
+  c1Events.push({ seq: 190, time: 21, turn: 12, text: '<dsh-dispatch target="#1">跨指挥官任务</dsh-dispatch>' });
   c1LastSeq = 191;
   c1LastAssistantSeq = 190;
   await client.poll();
@@ -767,8 +785,43 @@ async function clientTests() {
   if (hopTask === undefined || hopTask.status !== 'failed' || hopTask.detail.indexOf('跨指挥官派发已达上限') === -1) {
     throw new Error('hop guard wrong: ' + JSON.stringify(hopTask ?? null));
   }
-  if (calls.prompts.some((p) => p.id === 'c-2')) throw new Error('hopped dispatch must not reach the other commander');
-  console.log('OK: cross-commander hops are budgeted and blocked at the cap');
+  if (calls.prompts.some((p) => p.id === 'c-2' && p.content[0].text === '跨指挥官任务')) throw new Error('blocked hop must not reach the other commander');
+  console.log('OK: cross-commander hops consume budget and block at the cap');
+
+  // --- engine flow I2: queue promotion refreshes sentAt (grace stays honest) ---
+  record.lastBatchAt = 0;
+  listSnapshot.byId['w-2'].running = true; // human-busy → task must queue
+  c1Events.push({ seq: 195, time: 22, turn: 13, text: '<dsh-dispatch target="#3">排队任务</dsh-dispatch>' }); // '#3' = w-2
+  c1LastSeq = 196;
+  c1LastAssistantSeq = 195;
+  await client.poll();
+  const queuedTask = [...client.state.tasks.values()].find((t) => t.excerpt === '排队任务');
+  if (queuedTask === undefined || queuedTask.status !== 'waiting') throw new Error('queue setup wrong: ' + JSON.stringify(queuedTask ?? null));
+  queuedTask.sentAt = Date.now() - 600000; // aged FAR past the grace window while parked
+  const staleSentAt = queuedTask.sentAt;
+  listSnapshot.byId['w-2'].running = false; // worker freed → drain promotes
+  await client.poll(); // promotion tick (performSend must stamp a fresh sentAt)
+  if (queuedTask.status !== 'running') throw new Error('promotion wrong: ' + queuedTask.status);
+  if (queuedTask.sentAt <= staleSentAt) throw new Error('promoted task kept its STALE sentAt — settle grace is bypassable');
+  // Result lands AFTER the send (the baseline was probed inside the lock).
+  w2Events.push({ seq: 40, time: 23, turn: 5, text: '排队结果' });
+  w2LastSeq = 41;
+  w2LastAssistantSeq = 40;
+  w2LastEnd = { turn: 5, reason: 'stop' };
+  // Reset the takeover-flow handler: this worker is NOT human-driven.
+  eventHandlers['w-2'] = (cursor) => ({
+    ok: true,
+    sessionId: 'w-2',
+    events: w2Events.filter((e) => e.seq > cursor),
+    humanMessages: 0,
+    lastSeq: w2LastSeq,
+    lastAssistantSeq: w2LastAssistantSeq,
+    lastEnd: w2LastEnd,
+  });
+  queuedTask.sentAt = Date.now() - 10000;
+  await client.poll(); // settle with the fresh tail
+  if (queuedTask.status !== 'done' || queuedTask.detail.indexOf('排队结果') === -1) throw new Error('queued settle wrong: ' + JSON.stringify({ s: queuedTask.status, d: queuedTask.detail }));
+  console.log('OK: promoted tasks get fresh sentAt — grace window cannot be bypassed by queue wait');
 
   // --- engine flow J: fork context inheritance ---
   calls.forkOpts = [];
