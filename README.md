@@ -29,7 +29,10 @@ DeepSeek Harness Web GUI 的**指挥官**插件：把任意一个对话升级成
 - **循环防护**：派发给另一个激活中的指挥官允许但计入 `commanderHops` 预算（默认 10），超限拒绝，杜绝 A→B→A 乒乓烧 token。
 - **用量统计**：回执自动附带耗时与输出 token 数（聚合自回合 usage），面板每行可见 `⏱12s · ~579 tok`。
 - **结果自动回流**：worker 完成回合后，插件从 host 事件日志提取其新增输出，截为摘要，以 `[指挥官回执 · #N 「标题」] 状态：…` 的消息 queue 进指挥官会话——指挥官被唤醒继续汇总或继续派发，无需人工复制粘贴。
+- **产物回收**：回执自动附带 worker 的**变更文件清单**（从 write/edit 工具调用投影，去重保序），面板任务行显示 📄N 徽标、路径点击即复制——产出不再只是一段话。
+- **全文结果**：面板「全文」按钮拉取该任务的完整输出（200KB 上限内不截断），摘要之外随时可查原文。
 - **中断自动续跑**：worker 回合被截断（token 上限）或异常中止（aborted/error）时，插件自动向该 worker 发送续跑指令（"从中断处继续执行原始任务"），最多 `maxContinuations` 次；最终回执聚合中断前后全部输出并标注续跑次数。手动取消与人工接管永不触发续跑。
+- **失败自动换人（failover）**：续跑仍救不回来的失败任务，自动改派给负载最低的空闲 worker 重跑同一任务（`maxFailovers` 预算沿链继承，杜绝无限换人）；面板标注「已换人」，回执注明改派去向。
 - **批次汇总回执**：一次派发的多个任务全部结算后，额外注入一条 `[指挥官批次汇总 · N 项已全部结算]`，逐项带状态与结果预览，指挥官一眼消化整波结果。
 - **任务面板**：头部徽章显示进行中任务数，点击下拉面板：
   - 任务列表：状态点（排队/等依赖/运行/完成/失败/已接管）/ 目标 / 摘要 / 耗时与 token / 打开会话；
@@ -56,10 +59,11 @@ DeepSeek Harness Web GUI 的**指挥官**插件：把任意一个对话升级成
 
 ## 工作原理
 
-1. **host 半区**（`lib/index.js`）：设置命名空间 `dsh-commander` + 四条路由：
+1. **host 半区**（`lib/index.js`）：设置命名空间 `dsh-commander` + 五条路由：
    - `GET /api/dsh-commander/config` — 解析后的配置（POST 为设置面板白名单写回）；
    - `POST /api/dsh-commander/inject {sessionId,text}` — 把简报作为一条 plugin 来源的 user 消息静默追加进会话（context-compressor 同款 checkpoint 手法，不开回合）；
-   - `GET /api/dsh-commander/events?sessionId&cursor&limit` — 只读投影：cursor 之后已定型的 assistant 文本 + 最后一个 `turn/end` 原因 + cursor 之后**真人消息计数**（接管信号）+ 全日志尾部锚点；
+   - `GET /api/dsh-commander/events?sessionId&cursor&limit` — 只读投影：cursor 之后已定型的 assistant 文本 + 最后一个 `turn/end` 原因 + 真人消息计数（接管信号）+ **变更文件与工具统计** + 全日志尾部锚点；
+   - `GET /api/dsh-commander/fullresult?sessionId&baseline` — 任务完整输出（面板「全文」数据源）；
    - `GET|POST /api/dsh-commander/registry` — 持久指挥官注册表（`~/.dsh/dsh-commander/registry.json`），重启存活的关键。
 2. **浏览器半区**（`lib/client.js`）：模块级引擎单例以 ~2s 轮询每个激活指挥官的 events 尾部 → 正则解析 `<dsh-dispatch>` 块 → 广播展开（`#1,#2` / `all`）→ 纯函数策略闸门（并发/条数/累计上限）→ 经客户端 sessions 运行时 `binding(target).prompt(task,'queue')` 送达（或 `create({cwd})` 新建）→ 订阅 `sessions.list` 快照监视 worker 的 running 标志与 pendingInteraction（侧边栏同源信号）→ 结算后把回执 prompt 回指挥官；整批结算再补一条批次汇总。
 3. **UI**：两个增量坐席——`conversation.session.header.actions`（徽章+面板，与家族其他插件同款）与 `shell.overlay`（全局悬浮指示器），不替换任何原厂组合。
@@ -82,6 +86,7 @@ dsh-commander:
   maxCommanderHops: 10    # 跨指挥官派发预算（防循环）
   notify: true            # 后台桌面通知
   maxContinuations: 2     # 回合中断后自动续跑次数上限（0=关闭）
+  maxFailovers: 1         # 失败后自动换人重试次数（0=关闭）
 ```
 
 不配置即用以上默认值；也可直接在面板「设置」里改（写回此文件并即时生效）。

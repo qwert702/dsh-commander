@@ -48,7 +48,7 @@ console.log('OK: node --check passed (client.js + index.js)');
 function sanityChecks() {
   const host = fs.readFileSync(hostFile, 'utf8');
   const client = fs.readFileSync(bundle, 'utf8');
-  for (const marker of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', 'WRITABLE_KEYS', 'projectAssistantTail']) {
+  for (const marker of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', '/api/dsh-commander/fullresult', 'WRITABLE_KEYS', 'projectAssistantTail', 'pickFailoverCandidate']) {
     if (host.indexOf(marker) === -1) throw new Error('host missing marker: ' + marker);
   }
   for (const marker of ['workerLocks', 'sendOrQueue', 'drainWaitingQueues', 'expandBlocks', 'directDispatch', 'buildReportText', 'updateConfig', 'GlobalIndicator', 'shell.overlay']) {
@@ -120,11 +120,11 @@ async function hostTests() {
 
   const routeByPath = {};
   for (const route of registeredRoutes) routeByPath[route.path] = route;
-  for (const p of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', '/api/dsh-commander/registry']) {
+  for (const p of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', '/api/dsh-commander/fullresult', '/api/dsh-commander/registry']) {
     if (routeByPath[p] === undefined) throw new Error('route not registered: ' + p);
     if (routeByPath[p].kind !== 'exact') throw new Error('wrong kind for ' + p + ': ' + JSON.stringify(routeByPath[p]));
   }
-  console.log('OK: host registers the four routes');
+  console.log('OK: host registers the five routes');
 
   function fakeRes() {
     let status = 0;
@@ -242,6 +242,9 @@ async function hostTests() {
     { type: 'turn/end', seq: 6, time: 6, data: { turn: 2, reason: { kind: 'error' } } },
     { type: 'user/message', seq: 7, time: 7, data: { source: { kind: 'user' }, content: [] } },
     { type: 'user/message', seq: 8, time: 8, data: { source: { kind: 'plugin', plugin: 'dsh-commander' }, content: [] } },
+    { type: 'tool/call', seq: 9, time: 9, data: { turn: 3, step: 0, callId: 'c1', name: 'write', arguments: '{"file_path":"src/a.ts","content":"x"}' } },
+    { type: 'tool/call', seq: 10, time: 10, data: { turn: 3, step: 1, callId: 'c2', name: 'edit', arguments: '{"filePath":"docs/b.md","old_string":"a","new_string":"b"}' } },
+    { type: 'tool/call', seq: 11, time: 11, data: { turn: 3, step: 2, callId: 'c3', name: 'read', arguments: '{"file_path":"ignored.ts"}' } },
   ];
   sessionsById.set('log', makeSession('log', logEvents));
 
@@ -278,10 +281,17 @@ async function hostTests() {
   if (parsed.events.length !== 1 || parsed.events[0].seq !== 5 || parsed.events[0].text !== '新输出A' || parsed.events[0].turn !== 2) {
     throw new Error('events tail projection wrong: ' + JSON.stringify(parsed.events));
   }
-  if (parsed.lastSeq !== 8 || parsed.lastAssistantSeq !== 5) throw new Error('events anchors wrong: ' + JSON.stringify(parsed));
+  if (parsed.lastSeq !== 11 || parsed.lastAssistantSeq !== 5) throw new Error('events anchors wrong: ' + JSON.stringify(parsed));
   if (parsed.lastEnd?.reason !== 'error' || parsed.lastEnd?.turn !== 2) throw new Error('events lastEnd wrong');
   // One HUMAN user message after cursor=3 (seq7); the plugin-sourced one (seq8) must not count.
   if (parsed.humanMessages !== 1) throw new Error('events humanMessages wrong: ' + parsed.humanMessages);
+  // Artifacts: write+edit extracted, read ignored; per-tool counts reported.
+  if (!Array.isArray(parsed.files) || parsed.files.length !== 2 || parsed.files[0].path !== 'src/a.ts' || parsed.files[1].path !== 'docs/b.md') {
+    throw new Error('events files projection wrong: ' + JSON.stringify(parsed.files));
+  }
+  const writeStat = (parsed.tools ?? []).find((entry) => entry.name === 'write');
+  const readStat = (parsed.tools ?? []).find((entry) => entry.name === 'read');
+  if (writeStat === undefined || writeStat.count !== 1 || readStat === undefined || readStat.count !== 1) throw new Error('events tools projection wrong: ' + JSON.stringify(parsed.tools));
   // Usage rides through sanitized: numeric fields only, non-numeric dropped.
   if (parsed.events[0].usage?.output_tokens !== 123 || parsed.events[0].usage?.prompt_tokens !== 456 || parsed.events[0].usage?.cost_usd !== 0.02) {
     throw new Error('events usage projection wrong: ' + JSON.stringify(parsed.events[0].usage));
@@ -297,6 +307,38 @@ async function hostTests() {
   parsed = f.json();
   if (parsed.events.length !== 1 || parsed.events[0].seq !== 3) throw new Error('events limit clamp wrong');
   console.log('OK: host events route (validation matrix + tail projection + anchors)');
+
+  // --- fullresult route (complete task output for the panel 全文 viewer) ---
+  const fullRoute = routeByPath['/api/dsh-commander/fullresult'];
+  if (fullRoute === undefined) throw new Error('fullresult route not registered');
+  sessionsById.set('fr', makeSession('fr', [
+    { type: 'assistant/message', seq: 1, time: 1, data: { turn: 1, step: 0, message: { content: [{ type: 'text', text: '第一段' }] } } },
+    { type: 'assistant/message', seq: 2, time: 2, data: { turn: 2, step: 0, message: { content: [{ type: 'text', text: '第二段' }] } } },
+    { type: 'tool/call', seq: 3, time: 3, data: { callId: 'x', name: 'bash', arguments: '{}' } },
+  ]));
+  f = fakeRes();
+  await fullRoute.handler({ method: 'GET', url: '/api/dsh-commander/fullresult?sessionId=fr&baseline=0' }, f.res);
+  parsed = f.json();
+  if (parsed.ok !== true || parsed.text.indexOf('第一段') === -1 || parsed.text.indexOf('第二段') === -1 || parsed.truncated !== false || parsed.segments !== 2) {
+    throw new Error('fullresult happy wrong: ' + f.body());
+  }
+  f = fakeRes();
+  await fullRoute.handler({ method: 'GET', url: '/api/dsh-commander/fullresult?sessionId=fr&baseline=1' }, f.res);
+  parsed = f.json();
+  if (parsed.text !== '第二段' || parsed.segments !== 1) throw new Error('fullresult baseline filter wrong: ' + f.body());
+  f = fakeRes();
+  await fullRoute.handler({ method: 'GET', url: '/api/dsh-commander/fullresult' }, f.res);
+  if (f.status() !== 400) throw new Error('fullresult missing sessionId must 400');
+  f = fakeRes();
+  await fullRoute.handler({ method: 'GET', url: '/api/dsh-commander/fullresult?sessionId=fr&baseline=-2' }, f.res);
+  if (f.status() !== 400) throw new Error('fullresult bad baseline must 400');
+  f = fakeRes();
+  await fullRoute.handler({ method: 'GET', url: '/api/dsh-commander/fullresult?sessionId=ghost' }, f.res);
+  if (f.status() !== 404) throw new Error('fullresult ghost must 404');
+  f = fakeRes();
+  await fullRoute.handler({ method: 'POST', url: '/api/dsh-commander/fullresult' }, f.res);
+  if (f.status() !== 405) throw new Error('fullresult POST must 405');
+  console.log('OK: host fullresult route (aggregate / baseline filter / validation)');
 
   // --- registry route (durable commander set, survives harness restarts) ---
   const registryRoute = routeByPath['/api/dsh-commander/registry'];
@@ -982,13 +1024,21 @@ async function clientTests() {
   w2LastSeq = 76;
   w2LastAssistantSeq = 75;
   w2LastEnd = { turn: 10, reason: 'stop' };
+  // Artifacts ride the same projection: the receipt gains a changed-files line.
+  const prevW2Handler = eventHandlers['w-2'];
+  eventHandlers['w-2'] = (cursor) => ({ ...prevW2Handler(cursor), files: [{ path: 'docs/x.md', tool: 'edit' }] });
   fragTask.sentAt = Date.now() - 10000;
   await client.poll();
+  eventHandlers['w-2'] = prevW2Handler;
   if (fragTask.status !== 'done') throw new Error('flow M settle wrong: ' + fragTask.status);
   if (fragTask.detail.indexOf('部分结果') === -1 || fragTask.detail.indexOf('最终结果') === -1) {
     throw new Error('resumed receipt must aggregate both segments: ' + fragTask.detail);
   }
   if (fragTask.detail.indexOf('续跑 1 次') === -1) throw new Error('continuation note missing: ' + fragTask.detail);
+  if (!Array.isArray(fragTask.files) || fragTask.files.length !== 1 || fragTask.files[0].path !== 'docs/x.md') {
+    throw new Error('task files capture wrong: ' + JSON.stringify(fragTask.files));
+  }
+  if (fragTask.detail.indexOf('变更文件(1)：docs/x.md') === -1) throw new Error('receipt file line missing: ' + fragTask.detail);
   console.log('OK: interrupted turns auto-continue and receipts aggregate pre/post interruption');
 
   // --- exhaustion: maxContinuations=0 keeps today's fail-fast semantics ---
@@ -1009,6 +1059,22 @@ async function clientTests() {
   }
   client.state.config.maxContinuations = 2;
   console.log('OK: interruption budget is configurable — 0 restores pure fail-fast');
+
+  // --- failover fired inside the exhaustion case: assert + settle the child ---
+  const foChild = [...client.state.tasks.values()].find((t) => t.excerpt === '不续跑任务' && t.id !== noResumeTask.id);
+  if (foChild === undefined || foChild.workerId !== 'w-1') throw new Error('failover child wrong: ' + JSON.stringify(foChild ?? null));
+  if (noResumeTask.detail.indexOf('已自动改派给') === -1 || (noResumeTask.failovers | 0) !== 1) throw new Error('failover marker missing: ' + noResumeTask.detail);
+  if (!calls.prompts.some((p) => p.id === 'w-1' && p.content[0].text === '不续跑任务')) throw new Error('failover prompt missing');
+  // Settle the child (it inherited budget 1 → a second failure settles it for good).
+  client.state.config.maxContinuations = 0; // keep the continuation channel out of the way
+  foChild.sentAt = Date.now() - 10000;
+  w1Events.push({ seq: 105, time: 34, turn: 12, text: '' });
+  w1LastSeq = 106;
+  w1LastEnd = { turn: 12, reason: 'error' };
+  await client.poll();
+  client.state.config.maxContinuations = 2;
+  if (foChild.status !== 'failed' || (foChild.failovers | 0) !== 1) throw new Error('failover child settle wrong: ' + JSON.stringify({ s: foChild.status, f: foChild.failovers }));
+  console.log('OK: failover reassigns to least-loaded idle worker; budget inherits down the chain');
 
   // --- engine flow N: 强发 bypasses a stale-busy worker flag ---
   record.lastBatchAt = 0;
