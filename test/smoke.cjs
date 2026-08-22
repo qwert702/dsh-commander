@@ -36,6 +36,24 @@ execFileSync(process.execPath, ['--check', bundle], { stdio: 'inherit' });
 execFileSync(process.execPath, ['--check', hostFile], { stdio: 'inherit' });
 console.log('OK: node --check passed (client.js + index.js)');
 
+/**
+ * CI / fresh-clone mode: the harness packages are private, so a checkout
+ * without node_modules cannot run the functional halves. Fall back to syntax
+ * (above) plus structural sanity markers so regressions in route wiring and
+ * key engine pieces are still caught.
+ */
+function sanityChecks() {
+  const host = fs.readFileSync(hostFile, 'utf8');
+  const client = fs.readFileSync(bundle, 'utf8');
+  for (const marker of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', 'WRITABLE_KEYS', 'projectAssistantTail']) {
+    if (host.indexOf(marker) === -1) throw new Error('host missing marker: ' + marker);
+  }
+  for (const marker of ['workerLocks', 'sendOrQueue', 'drainWaitingQueues', 'expandBlocks', 'directDispatch', 'buildReportText', 'updateConfig', 'GlobalIndicator', 'shell.overlay']) {
+    if (client.indexOf(marker) === -1) throw new Error('client missing marker: ' + marker);
+  }
+  console.log('OK: structural markers present (syntax-only CI mode)');
+}
+
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
@@ -52,6 +70,7 @@ async function hostTests() {
   const appended = [];
   const flushed = [];
   let namespaceConfig = null;
+  const configPatches = [];
   const sessionsById = new Map();
 
   function makeSession(id, events) {
@@ -72,7 +91,17 @@ async function hostTests() {
   const ctx = {
     effect(fn) { fn(); },
     inject(services, cb) {
-      cb({ settings: { register: () => ({ get: () => namespaceConfig }) } });
+      cb({
+      settings: {
+        register: () => ({
+          get: () => namespaceConfig,
+          async update(patch) {
+            configPatches.push(JSON.parse(JSON.stringify(patch)));
+            namespaceConfig = { ...(namespaceConfig ?? {}), ...patch };
+          },
+        }),
+      },
+    });
     },
     webServer: {
       register(route) { registeredRoutes.push(route); return () => {}; },
@@ -129,11 +158,26 @@ async function hostTests() {
   await routeByPath['/api/dsh-commander/config'].handler({ method: 'GET', url: '/api/dsh-commander/config' }, f.res);
   parsed = f.json();
   if (parsed.config.enabled !== false || parsed.config.maxOutstanding !== 9) throw new Error('config overrides wrong: ' + f.body());
+  namespaceConfig = { enabled: true };
   f = fakeRes();
-  await routeByPath['/api/dsh-commander/config'].handler({ method: 'POST', url: '/api/dsh-commander/config' }, f.res);
-  if (f.status() !== 405 || f.json().error.code !== 'method-not-allowed') throw new Error('config 405 wrong');
-  namespaceConfig = null;
-  console.log('OK: host config route (defaults / overrides / 405)');
+  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', '{oops'), f.res);
+  if (f.status() !== 400) throw new Error('config POST bad JSON must 400: status=' + f.status() + ' body=' + f.body());
+  f = fakeRes();
+  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', { noPatch: true }), f.res);
+  if (f.status() !== 400) throw new Error('config POST missing patch must 400: ' + f.body());
+  f = fakeRes();
+  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', { patch: { pollIntervalMs: 3000, maxOutstanding: 7, bogus: 'x', autoReport: false } }), f.res);
+  parsed = f.json();
+  if (f.status() !== 200 || parsed.ok !== true) throw new Error('config POST happy wrong: ' + f.status() + ' ' + f.body());
+  if (configPatches.length !== 1) throw new Error('scope.update not called');
+  if (JSON.stringify(configPatches[0]) !== JSON.stringify({ pollIntervalMs: 3000, maxOutstanding: 7, autoReport: false })) {
+    throw new Error('whitelist filter wrong: ' + JSON.stringify(configPatches[0]));
+  }
+  if (namespaceConfig.pollIntervalMs !== 3000 || namespaceConfig.autoReport !== false) throw new Error('patch not persisted into namespace');
+  f = fakeRes();
+  await routeByPath['/api/dsh-commander/config'].handler({ method: 'PATCH', url: '/api/dsh-commander/config' }, f.res);
+  if (f.status() !== 405) throw new Error('config PATCH must 405: status=' + f.status());
+  console.log('OK: host config route (read / whitelist write-back / validation / 405)');
 
   // --- inject route ---
   const injectRoute = routeByPath['/api/dsh-commander/inject'];
@@ -189,7 +233,7 @@ async function hostTests() {
     { type: 'assistant/chunk', seq: 2, time: 2, data: {} },
     { type: 'assistant/message', seq: 3, time: 3, data: { turn: 1, step: 0, message: { content: [{ type: 'text', text: '旧的' }] } } },
     { type: 'turn/end', seq: 4, time: 4, data: { turn: 1, reason: { kind: 'stop' } } },
-    { type: 'assistant/message', seq: 5, time: 5, data: { turn: 2, step: 0, message: { content: [{ type: 'reasoning', text: '思考中' }, { type: 'text', text: '新输出A' }] } } },
+    { type: 'assistant/message', seq: 5, time: 5, data: { turn: 2, step: 0, message: { content: [{ type: 'reasoning', text: '思考中' }, { type: 'text', text: '新输出A' }] }, usage: { output_tokens: 123, prompt_tokens: 456, cost_usd: 0.02 } } },
     { type: 'turn/end', seq: 6, time: 6, data: { turn: 2, reason: { kind: 'error' } } },
     { type: 'user/message', seq: 7, time: 7, data: { source: { kind: 'user' }, content: [] } },
     { type: 'user/message', seq: 8, time: 8, data: { source: { kind: 'plugin', plugin: 'dsh-commander' }, content: [] } },
@@ -233,6 +277,10 @@ async function hostTests() {
   if (parsed.lastEnd?.reason !== 'error' || parsed.lastEnd?.turn !== 2) throw new Error('events lastEnd wrong');
   // One HUMAN user message after cursor=3 (seq7); the plugin-sourced one (seq8) must not count.
   if (parsed.humanMessages !== 1) throw new Error('events humanMessages wrong: ' + parsed.humanMessages);
+  // Usage rides through sanitized: numeric fields only, non-numeric dropped.
+  if (parsed.events[0].usage?.output_tokens !== 123 || parsed.events[0].usage?.prompt_tokens !== 456 || parsed.events[0].usage?.cost_usd !== 0.02) {
+    throw new Error('events usage projection wrong: ' + JSON.stringify(parsed.events[0].usage));
+  }
 
   f = fakeRes();
   await eventsRoute.handler({ method: 'GET', url: '/api/dsh-commander/events?sessionId=log&cursor=99' }, f.res);
@@ -261,7 +309,7 @@ async function clientTests() {
 
   // Fetch mock routing by URL; per-session event handlers respect the cursor
   // so repeated polls are idempotent exactly like the real host route.
-  const calls = { inject: [], prompts: [], renames: [], createOpts: [], cancels: [] };
+  const calls = { inject: [], prompts: [], renames: [], createOpts: [], cancels: [], forkOpts: [] };
   let configPayload = { ok: true, config: { enabled: true } };
   const eventHandlers = {};
 
@@ -722,6 +770,120 @@ async function clientTests() {
   if (calls.prompts.some((p) => p.id === 'c-2')) throw new Error('hopped dispatch must not reach the other commander');
   console.log('OK: cross-commander hops are budgeted and blocked at the cap');
 
+  // --- engine flow J: fork context inheritance ---
+  calls.forkOpts = [];
+  sessionsMock.fork = async (opts) => {
+    calls.forkOpts.push(opts);
+    listSnapshot.ids.push('session-fork');
+    listSnapshot.byId['session-fork'] = { id: 'session-fork', displayTitle: 'session-fork', running: false, blank: false };
+    addFace('session-fork');
+    return 'session-fork';
+  };
+  record.lastBatchAt = 0;
+  c1Events.push({ seq: 200, time: 22, turn: 12, text: '<dsh-dispatch fork="commander" title="分身">带上下文任务</dsh-dispatch>' });
+  c1LastSeq = 201;
+  c1LastAssistantSeq = 200;
+  await client.poll();
+  const forkTask = [...client.state.tasks.values()].find((t) => t.excerpt === '带上下文任务');
+  if (forkTask === undefined || forkTask.status !== 'running' || forkTask.workerId !== 'session-fork' || forkTask.workerTitle !== '分身') {
+    throw new Error('fork flow wrong: ' + JSON.stringify(forkTask ?? null));
+  }
+  if (calls.forkOpts.length !== 1 || calls.forkOpts[0].sessionId !== 'c-1') throw new Error('fork opts wrong: ' + JSON.stringify(calls.forkOpts));
+  if (calls.createOpts.length !== 1) throw new Error('fork must bypass plain create');
+  if (!calls.renames.some((r) => r.id === 'session-fork' && r.title === '分身')) throw new Error('fork rename wrong');
+  const forkPrompt = calls.prompts.find((p) => p.id === 'session-fork');
+  if (forkPrompt === undefined || forkPrompt.content[0].text !== '带上下文任务') throw new Error('fork prompt wrong');
+  console.log('OK: fork=commander creates an inheriting worker via sessions.fork');
+
+  // --- engine flow K: dependency gate (happy path + fail-fast) ---
+  record.lastBatchAt = 0;
+  c1Events.push({ seq: 210, time: 23, turn: 13, text: '<dsh-dispatch tid="alpha" target="#2">前置任务</dsh-dispatch><dsh-dispatch depends="alpha" target="#3">后续任务</dsh-dispatch>' });
+  c1LastSeq = 211;
+  c1LastAssistantSeq = 210;
+  await client.poll();
+  const alphaTask = [...client.state.tasks.values()].find((t) => t.excerpt === '前置任务');
+  const betaTask = [...client.state.tasks.values()].find((t) => t.excerpt === '后续任务');
+  if (alphaTask === undefined || betaTask === undefined) throw new Error('flow K tasks missing');
+  if (alphaTask.status !== 'running') throw new Error('alpha should dispatch immediately: ' + alphaTask.status);
+  if (betaTask.status !== 'blocked-dep') throw new Error('beta should wait on alpha: ' + betaTask.status);
+  if (calls.prompts.some((p) => p.id === 'w-2' && p.content[0].text === '后续任务')) throw new Error('beta must not send while gated');
+  // Settle alpha with usage attached — the receipt must aggregate tokens.
+  alphaTask.sentAt = Date.now() - 10000;
+  w1Events.push({ seq: 100, time: 24, turn: 11, text: 'A完成', usage: { output_tokens: 123, prompt_tokens: 456 } });
+  w1LastSeq = 101;
+  w1LastAssistantSeq = 100;
+  w1LastEnd = { turn: 11, reason: 'stop' };
+  await client.poll();
+  if (alphaTask.status !== 'done' || !alphaTask.detail.includes('A完成') || !alphaTask.detail.includes('~579 tok')) {
+    throw new Error('alpha settle/usage wrong: ' + JSON.stringify(alphaTask.detail));
+  }
+  if (betaTask.status !== 'running') throw new Error('beta not promoted after alpha done: ' + betaTask.status);
+  const betaPrompt = calls.prompts.find((p) => p.id === 'w-2' && p.content[0].text === '后续任务');
+  if (betaPrompt === undefined) throw new Error('beta prompt missing after promotion');
+  // Reset the stale takeover-flow handler: beta's worker is NOT human-driven.
+  eventHandlers['w-2'] = (cursor) => ({
+    ok: true,
+    sessionId: 'w-2',
+    events: w2Events.filter((e) => e.seq > cursor),
+    humanMessages: 0,
+    lastSeq: w2LastSeq,
+    lastAssistantSeq: w2LastAssistantSeq,
+    lastEnd: w2LastEnd,
+  });
+  betaTask.sentAt = Date.now() - 10000;
+  w2Events.push({ seq: 50, time: 25, turn: 4, text: 'B完成' });
+  w2LastSeq = 51;
+  w2LastAssistantSeq = 50;
+  w2LastEnd = { turn: 4, reason: 'stop' };
+  await client.poll();
+  if (betaTask.status !== 'done' || !betaTask.detail.includes('B完成')) throw new Error('beta settle wrong: ' + betaTask.detail);
+  console.log('OK: tid/depends chain gates and promotes; usage aggregates into the receipt');
+
+  // --- dependency fail-fast on unknown names ---
+  record.lastBatchAt = 0;
+  c1Events.push({ seq: 220, time: 26, turn: 14, text: '<dsh-dispatch depends="ghost" target="#2">幽灵任务</dsh-dispatch>' });
+  c1LastSeq = 221;
+  c1LastAssistantSeq = 220;
+  await client.poll();
+  const ghostTask = [...client.state.tasks.values()].find((t) => t.excerpt === '幽灵任务');
+  if (ghostTask === undefined || ghostTask.status !== 'failed' || ghostTask.detail.indexOf('依赖不存在') === -1) {
+    throw new Error('ghost dep wrong: ' + JSON.stringify(ghostTask ?? null));
+  }
+  console.log('OK: dependencies referencing nothing fail fast');
+
+  // --- manual dispatch / report / notifications ---
+  const directBefore = calls.prompts.length;
+  await client.directDispatch('c-1', { target: '#2', task: '手动直派任务' });
+  const manualTask = [...client.state.tasks.values()].find((t) => t.excerpt === '手动直派任务');
+  if (manualTask === undefined || manualTask.workerId !== 'w-1' || manualTask.status !== 'running') {
+    throw new Error('direct dispatch wrong: ' + JSON.stringify(manualTask ?? null));
+  }
+  if (calls.prompts.length !== directBefore + 1 || calls.prompts[calls.prompts.length - 1].content[0].text !== '手动直派任务') {
+    throw new Error('direct dispatch prompt wrong');
+  }
+  let emptyThrew = false;
+  try { await client.directDispatch('c-1', { target: '#2', task: '   ' }); } catch { emptyThrew = true; }
+  if (!emptyThrew) throw new Error('empty direct task must throw');
+  const report = client.buildReportText('c-1');
+  for (const needle of ['# 指挥官报告', '手动直派任务', '## [', '生成时间']) {
+    if (report.indexOf(needle) === -1) throw new Error('report missing ' + needle);
+  }
+  calls.notifies = [];
+  global.window = { focus() {} }; // notifyUser guards on window presence
+  global.Notification = class FakeNotification {
+    constructor(title, body) { calls.notifies.push({ title, body }); }
+  };
+  Object.defineProperty(global.Notification, 'permission', { value: 'granted', configurable: true, writable: true });
+  try {
+    client.notifyUser('测试通知', '内容');
+    client.notifyUser('第二条', '被节流'); // inside the throttle window
+  } finally {
+    delete global.Notification;
+    delete global.window;
+  }
+  if (calls.notifies.length !== 1 || calls.notifies[0].title !== '测试通知') throw new Error('notify wrong: ' + JSON.stringify(calls.notifies));
+  console.log('OK: direct dispatch respects guards; report renders; notifications throttle');
+
   // --- persistence: tasks mirrored into localStorage ---
   const storedTasks = JSON.parse(storageMap.get('dsh-commander.tasks'));
   if (!Array.isArray(storedTasks) || storedTasks.length < 5) throw new Error('tasks storage missing: ' + storedTasks.length);
@@ -769,6 +931,11 @@ async function clientTests() {
 }
 
 async function main() {
+  if (!fs.existsSync(localNodeModules) && !fs.existsSync(harnessModules)) {
+    sanityChecks();
+    console.log('all smoke tests passed (syntax-only mode)');
+    return;
+  }
   await hostTests();
   await clientTests();
   console.log('all smoke tests passed');
