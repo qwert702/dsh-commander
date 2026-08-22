@@ -1102,6 +1102,57 @@ async function clientTests() {
   }
   console.log('OK: 强发 bypasses a stale-busy flag while keeping lock FIFO');
 
+  // --- engine flow P: tail-anchor probes retry then FAIL CLOSED ---
+  // A failed probe must never degrade to cursor 0, or the next poll would
+  // replay the whole conversation history as fresh dispatches.
+  for (const [pid, ptitle] of [['c-p', '探针失败'], ['c-r', '探针重试'], ['c-gone', '已消失']]) {
+    if (!listSnapshot.ids.includes(pid)) {
+      listSnapshot.ids.push(pid);
+      listSnapshot.byId[pid] = { id: pid, displayTitle: ptitle, title: '', cwd: '', running: false, completed: false, blank: false };
+    }
+  }
+  // (a) persistent transport failure → activation aborts loudly, registers nothing
+  let cpCalls = 0;
+  eventHandlers['c-p'] = () => {
+    cpCalls += 1;
+    return { ok: false, error: { code: 'transport', message: 'boom' } };
+  };
+  let probeThrew = false;
+  try { await client.activate('c-p'); } catch (error) {
+    probeThrew = error instanceof Error && error.message.indexOf('游标探测失败') !== -1;
+  }
+  if (!probeThrew) throw new Error('dead probe must abort activation with the explicit message');
+  if (client.state.active.includes('c-p') || client.state.commanders.has('c-p')) throw new Error('failed probe must not register a commander');
+  if (cpCalls < 2) throw new Error('probe did not retry before giving up');
+  console.log('OK: dead tail probe aborts activation (fail closed)');
+  // (b) flaky probe that recovers on attempt #3 → restored at the CORRECT anchor
+  let crCalls = 0;
+  eventHandlers['c-r'] = () => {
+    crCalls += 1;
+    if (crCalls < 3) return { ok: false, error: { code: 'transport', message: 'flaky' } };
+    return { ok: true, sessionId: 'c-r', events: [], humanMessages: 0, lastSeq: 7777, lastAssistantSeq: 7777, lastEnd: null };
+  };
+  await client.activate('c-r');
+  const crRecord = client.state.commanders.get('c-r');
+  if (crRecord === undefined || crRecord.cursor !== 7777) throw new Error('probe-retry cursor wrong: ' + JSON.stringify(crRecord ?? null));
+  client.deactivate('c-r');
+  // restoreCommanders shares the probe: a persistent failure SKIPS the id.
+  eventHandlers['c-r'] = () => ({ ok: false, error: { code: 'transport', message: 'still down' } });
+  await client.restoreCommanders(['c-r']);
+  if (client.state.active.includes('c-r') || client.state.commanders.has('c-r')) throw new Error('fail-closed violated on restore path');
+  console.log('OK: restore probes retry and fail closed against history replay');
+  // (c) session-not-found short-circuits without wasting retries
+  let cgCalls = 0;
+  eventHandlers['c-gone'] = () => {
+    cgCalls += 1;
+    return { ok: false, error: { code: 'session-not-found', message: 'gone' } };
+  };
+  let goneThrew = false;
+  try { await client.activate('c-gone'); } catch { goneThrew = true; }
+  if (!goneThrew) throw new Error('session-not-found must abort activation');
+  if (cgCalls !== 1) throw new Error('session-not-found must not be retried: ' + cgCalls);
+  console.log('OK: session-not-found probes fail fast without retries');
+
 
   // --- manual dispatch / report / notifications ---
   const directBefore = calls.prompts.length;
