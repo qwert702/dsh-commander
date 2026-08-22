@@ -518,8 +518,14 @@ async function clientTests() {
   if (roster[0].alias !== '#1' || roster[0].id !== 'w-a' || roster[0].title !== 'A会话') throw new Error('roster sort/alias wrong: ' + JSON.stringify(roster));
   if (roster[1].alias !== '#2' || roster[1].running !== true) throw new Error('roster second row wrong');
   const briefing = client.briefingText(roster);
-  for (const needle of ['#1 「A会话」', '<dsh-dispatch', '</dsh-dispatch>', '花名册', '自包含']) {
+  for (const needle of ['#1 「A会话」', '<dsh-dispatch', '</dsh-dispatch>', '花名册', '自包含', '负载均衡', '（空闲）']) {
     if (briefing.indexOf(needle) === -1) throw new Error('briefing missing ' + needle);
+  }
+  // Load markers steer the model toward free workers.
+  const loadedRoster = client.buildRoster(rosterList, 'c-1', new Map([['w-a', 2]]));
+  const loadedBriefing = client.briefingText(loadedRoster);
+  if (!loadedBriefing.includes('#1 「A会话」 id=w-a（进行中 2 个任务）') || !loadedBriefing.includes('#2 「B会话」 id=w-b（空闲）')) {
+    throw new Error('briefing load markers wrong:\n' + loadedBriefing.split('\n').filter((l) => l.startsWith('#')).join('\n'));
   }
   console.log('OK: buildRoster + briefingText');
 
@@ -868,6 +874,7 @@ async function clientTests() {
   if (queuedTask.status !== 'done' || queuedTask.detail.indexOf('排队结果') === -1) throw new Error('queued settle wrong: ' + JSON.stringify({ s: queuedTask.status, d: queuedTask.detail }));
   console.log('OK: promoted tasks get fresh sentAt — grace window cannot be bypassed by queue wait');
 
+
   // --- engine flow J: fork context inheritance ---
   calls.forkOpts = [];
   sessionsMock.fork = async (opts) => {
@@ -1002,6 +1009,7 @@ async function clientTests() {
   }
   client.state.config.maxContinuations = 2;
   console.log('OK: interruption budget is configurable — 0 restores pure fail-fast');
+
 
   // --- manual dispatch / report / notifications ---
   const directBefore = calls.prompts.length;
