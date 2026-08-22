@@ -1,0 +1,6 @@
+# dsh-commander profile patch (activated via dsh.bundle once installed):
+# the client rides the additive `conversation.session.header.actions` list seat,
+# so nothing in the stock composition is replaced or disabled.
+- insert:
+    - id: ui-dsh-commander
+      name: 'dsh-commander'
