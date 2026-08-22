@@ -191,6 +191,8 @@ async function hostTests() {
     { type: 'turn/end', seq: 4, time: 4, data: { turn: 1, reason: { kind: 'stop' } } },
     { type: 'assistant/message', seq: 5, time: 5, data: { turn: 2, step: 0, message: { content: [{ type: 'reasoning', text: '思考中' }, { type: 'text', text: '新输出A' }] } } },
     { type: 'turn/end', seq: 6, time: 6, data: { turn: 2, reason: { kind: 'error' } } },
+    { type: 'user/message', seq: 7, time: 7, data: { source: { kind: 'user' }, content: [] } },
+    { type: 'user/message', seq: 8, time: 8, data: { source: { kind: 'plugin', plugin: 'dsh-commander' }, content: [] } },
   ];
   sessionsById.set('log', makeSession('log', logEvents));
 
@@ -227,8 +229,10 @@ async function hostTests() {
   if (parsed.events.length !== 1 || parsed.events[0].seq !== 5 || parsed.events[0].text !== '新输出A' || parsed.events[0].turn !== 2) {
     throw new Error('events tail projection wrong: ' + JSON.stringify(parsed.events));
   }
-  if (parsed.lastSeq !== 6 || parsed.lastAssistantSeq !== 5) throw new Error('events anchors wrong: ' + JSON.stringify(parsed));
+  if (parsed.lastSeq !== 8 || parsed.lastAssistantSeq !== 5) throw new Error('events anchors wrong: ' + JSON.stringify(parsed));
   if (parsed.lastEnd?.reason !== 'error' || parsed.lastEnd?.turn !== 2) throw new Error('events lastEnd wrong');
+  // One HUMAN user message after cursor=3 (seq7); the plugin-sourced one (seq8) must not count.
+  if (parsed.humanMessages !== 1) throw new Error('events humanMessages wrong: ' + parsed.humanMessages);
 
   f = fakeRes();
   await eventsRoute.handler({ method: 'GET', url: '/api/dsh-commander/events?sessionId=log&cursor=99' }, f.res);
@@ -257,7 +261,7 @@ async function clientTests() {
 
   // Fetch mock routing by URL; per-session event handlers respect the cursor
   // so repeated polls are idempotent exactly like the real host route.
-  const calls = { inject: [], prompts: [], renames: [], createOpts: [] };
+  const calls = { inject: [], prompts: [], renames: [], createOpts: [], cancels: [] };
   let configPayload = { ok: true, config: { enabled: true } };
   const eventHandlers = {};
 
@@ -285,10 +289,11 @@ async function clientTests() {
 
   // Sessions runtime mock: list snapshot store + lazy bindings + create().
   const listSnapshot = {
-    ids: ['c-1', 'w-1', 'blank'],
+    ids: ['c-1', 'w-1', 'w-2', 'blank'],
     byId: {
       'c-1': { id: 'c-1', displayTitle: '指挥官会话', title: '', cwd: 'D:/proj', running: false, completed: false, blank: false },
       'w-1': { id: 'w-1', displayTitle: 'Worker A', title: '', cwd: 'D:/proj', running: true, completed: false, blank: false },
+      'w-2': { id: 'w-2', displayTitle: 'Worker B', title: '', cwd: 'D:/proj', running: false, completed: false, blank: false },
       blank: { id: 'blank', displayTitle: '空白', blank: true },
     },
     current: 'c-1',
@@ -299,11 +304,13 @@ async function clientTests() {
       sessionId: id,
       async prompt(content, mode) { calls.prompts.push({ id, content, mode }); return { ok: true }; },
       async rename(title) { calls.renames.push({ id, title }); return { ok: true, title, seq: 1 }; },
+      async cancel() { calls.cancels.push(id); return { ok: true }; },
     };
     return faces[id];
   }
   addFace('c-1');
   addFace('w-1');
+  addFace('w-2');
   const sessionsMock = {
     list: { getSnapshot: () => listSnapshot, subscribe() { return () => {}; } },
     binding(id) { return faces[id] !== undefined ? { sessionId: id, session: faces[id] } : undefined; },
@@ -358,8 +365,11 @@ async function clientTests() {
   const entry = entries.find((e) => e.opts.name === 'conversation.session.header.actions');
   if (entry === undefined) throw new Error('header.actions entry not registered');
   if (entry.opts.id !== 'dsh-commander' || entry.opts.priority !== 10) throw new Error('wrong header action opts: ' + JSON.stringify(entry.opts));
+  if (!injectedSeats.includes('shell.overlay')) throw new Error('shell.overlay seat not injected (global indicator)');
+  const overlay = entries.find((e) => e.opts.name === 'shell.overlay');
+  if (overlay === undefined || overlay.opts.id !== 'dsh-commander-global') throw new Error('global indicator entry wrong: ' + JSON.stringify(overlay?.opts));
   if (client.state.booted !== true) throw new Error('engine not booted by apply()');
-  console.log('OK: client registers header.actions entry and boots the engine');
+  console.log('OK: client registers both seats and boots the engine');
 
   // --- protocol parsing ---
   let blocks = client.parseDispatchBlocks('');
@@ -423,10 +433,12 @@ async function clientTests() {
   console.log('OK: buildRoster + briefingText');
 
   // --- config normalization + loading ---
-  let normalized = client.normalizeConfig({ enabled: 'yes', pollIntervalMs: 1, autoReport: false });
-  if (normalized.enabled !== false || normalized.pollIntervalMs !== 500 || normalized.autoReport !== false) throw new Error('normalize wrong: ' + JSON.stringify(normalized));
+  let normalized = client.normalizeConfig({ enabled: 'yes', pollIntervalMs: 1, autoReport: false, stuckTimeoutMs: 1, autoLabelWorkers: false });
+  if (normalized.enabled !== false || normalized.pollIntervalMs !== 500 || normalized.autoReport !== false || normalized.stuckTimeoutMs !== 30000 || normalized.autoLabelWorkers !== false) {
+    throw new Error('normalize wrong: ' + JSON.stringify(normalized));
+  }
   normalized = client.normalizeConfig({});
-  if (normalized.maxOutstanding !== 5 || normalized.autoReport !== true || normalized.maxTaskChars !== 4000) throw new Error('normalize defaults wrong');
+  if (normalized.maxOutstanding !== 5 || normalized.autoReport !== true || normalized.maxTaskChars !== 4000 || normalized.stuckTimeoutMs !== 600000 || normalized.autoLabelWorkers !== true) throw new Error('normalize defaults wrong');
 
   configPayload = { ok: true, config: { enabled: false, maxOutstanding: 7 } };
   let loaded = await client.loadConfig();
@@ -436,6 +448,18 @@ async function clientTests() {
   if (loaded.enabled !== true || loaded.maxOutstanding !== 5) throw new Error('loadConfig fallback wrong');
   configPayload = { ok: true, config: { enabled: true } };
   console.log('OK: loadConfig merge + fallback, normalizeConfig clamps');
+
+  // --- broadcast expansion ---
+  const smallRoster = [{ id: 'a' }, { id: 'b' }];
+  let expanded = client.expandBlocks([{ target: '#1,#2', task: 'x', title: '' }], smallRoster);
+  if (expanded.length !== 2 || expanded[0].target !== '#1' || expanded[1].target !== '#2') throw new Error('comma expansion wrong: ' + JSON.stringify(expanded));
+  expanded = client.expandBlocks([{ target: 'ALL', task: 'y', title: '' }], smallRoster);
+  if (expanded.length !== 2 || expanded[0].target !== 'a' || expanded[1].target !== 'b') throw new Error('all expansion wrong: ' + JSON.stringify(expanded));
+  expanded = client.expandBlocks([{ target: '', task: 'z', title: '' }], smallRoster);
+  if (expanded.length !== 1 || expanded[0].target !== '') throw new Error('plain passthrough wrong');
+  expanded = client.expandBlocks([{ target: ' #1 , ,#2 ', task: 'w', title: '' }], smallRoster);
+  if (expanded.length !== 2) throw new Error('whitespace/empty-part expansion wrong: ' + JSON.stringify(expanded));
+  console.log('OK: expandBlocks covers comma / all / passthrough');
 
   // --- engine flow A: activation ---
   let c1Events = [];
@@ -455,9 +479,10 @@ async function clientTests() {
   if (calls.inject.length !== 1) throw new Error('activation must inject one briefing');
   if (calls.inject[0].sessionId !== 'c-1') throw new Error('briefing sent to wrong session');
   if (calls.inject[0].text.indexOf('#1 「Worker A」') === -1) throw new Error('briefing missing roster line');
+  if (calls.inject[0].text.indexOf('#2 「Worker B」') === -1 || calls.inject[0].text.indexOf('target="all"') === -1) throw new Error('briefing missing second roster line / broadcast syntax');
   let record = client.state.commanders.get('c-1');
   if (record === undefined || record.cursor !== 100) throw new Error('activation cursor wrong: ' + (record && record.cursor));
-  if (record.roster.length !== 1 || record.roster[0].id !== 'w-1') throw new Error('activation roster wrong');
+  if (record.roster.length !== 2 || record.roster[0].id !== 'w-1' || record.roster[1].alias !== '#2') throw new Error('activation roster wrong');
   if (!client.state.active.includes('c-1')) throw new Error('active list wrong');
   console.log('OK: activate injects the briefing and pins the cursor to the tail');
 
@@ -474,9 +499,23 @@ async function clientTests() {
     ok: true,
     sessionId: 'w-1',
     events: w1Events.filter((e) => e.seq > cursor),
+    humanMessages: 0,
     lastSeq: w1LastSeq,
     lastAssistantSeq: w1LastAssistantSeq,
     lastEnd: w1LastEnd,
+  });
+  let w2Events = [];
+  let w2LastSeq = 10;
+  let w2LastAssistantSeq = 10;
+  let w2LastEnd = null;
+  eventHandlers['w-2'] = (cursor) => ({
+    ok: true,
+    sessionId: 'w-2',
+    events: w2Events.filter((e) => e.seq > cursor),
+    humanMessages: 0,
+    lastSeq: w2LastSeq,
+    lastAssistantSeq: w2LastAssistantSeq,
+    lastEnd: w2LastEnd,
   });
 
   await client.poll();
@@ -527,6 +566,113 @@ async function clientTests() {
   if (createdPrompt === undefined || createdPrompt.content[0].text !== '做B') throw new Error('created-worker prompt wrong');
   console.log('OK: omitted target auto-creates a worker with inherited cwd + rename');
 
+  // --- engine flow E: broadcast to two workers + batch roll-up summary ---
+  client.state.commanders.get('c-1').lastBatchAt = 0;
+  c1Events.push({ seq: 150, time: 13, turn: 5, text: '<dsh-dispatch target="#1,#2">并行做C</dsh-dispatch>' });
+  c1LastSeq = 151;
+  c1LastAssistantSeq = 150;
+  listSnapshot.byId['w-1'].running = true;
+  listSnapshot.byId['w-2'].running = true;
+  await client.poll();
+  const waveC = [...client.state.tasks.values()].filter((t) => t.excerpt === '并行做C');
+  if (waveC.length !== 2 || !waveC.every((t) => t.workerId === 'w-1' || t.workerId === 'w-2')) throw new Error('broadcast dispatch wrong: ' + JSON.stringify(waveC));
+  if (calls.prompts.filter((p) => (p.id === 'w-1' || p.id === 'w-2') && p.content[0].text === '并行做C').length !== 2) {
+    throw new Error('broadcast must deliver the task to BOTH workers');
+  }
+  // Settle both workers; expect two receipts plus ONE consolidated batch report.
+  for (const rowId of ['w-1', 'w-2']) listSnapshot.byId[rowId].running = false;
+  for (const t of waveC) t.sentAt = Date.now() - 10000;
+  // Results land AFTER the dispatch (baselines were probed at dispatch time).
+  w1Events.push({ seq: 70, time: 14, turn: 4, text: 'C1结果' });
+  w1LastSeq = 71;
+  w1LastAssistantSeq = 70;
+  w1LastEnd = { turn: 4, reason: 'stop' };
+  w2Events.push({ seq: 20, time: 14, turn: 2, text: 'C2结果' });
+  w2LastSeq = 21;
+  w2LastAssistantSeq = 20;
+  w2LastEnd = { turn: 2, reason: 'stop' };
+  const promptsBeforeBatch = calls.prompts.filter((p) => p.id === 'c-1').length;
+  await client.poll();
+  if (!waveC.every((t) => t.status === 'done')) throw new Error('broadcast settle wrong: ' + JSON.stringify(waveC.map((t) => t.status)));
+  const afterWave = calls.prompts.filter((p) => p.id === 'c-1');
+  if (afterWave.length - promptsBeforeBatch !== 3) throw new Error('expected 2 receipts + 1 batch summary, got ' + (afterWave.length - promptsBeforeBatch));
+  const batchReport = afterWave[afterWave.length - 1].content[0].text;
+  if (!batchReport.includes('[指挥官批次汇总') || !batchReport.includes('C1结果') || !batchReport.includes('#2')) {
+    throw new Error('batch summary wrong: ' + batchReport);
+  }
+  console.log('OK: broadcast delivers to both workers and rolls the batch up into one summary');
+
+  // --- engine flow F: stuck flag + human takeover (NO receipt) ---
+  client.state.commanders.get('c-1').lastBatchAt = 0;
+  c1Events.push({ seq: 160, time: 15, turn: 6, text: '<dsh-dispatch target="#2">做D</dsh-dispatch>' });
+  c1LastSeq = 161;
+  c1LastAssistantSeq = 160;
+  listSnapshot.byId['w-2'].running = true;
+  await client.poll();
+  const takeoverTask = [...client.state.tasks.values()].find((t) => t.excerpt === '做D');
+  if (takeoverTask === undefined || takeoverTask.status !== 'running') throw new Error('takeover setup wrong');
+  // Worker asks for a permission confirmation -> panel must flag it.
+  listSnapshot.byId['w-2'].pendingInteraction = { kind: 'permission' };
+  await client.poll();
+  if (takeoverTask.stuck !== true) throw new Error('stuck flag not set');
+  // The human answers IN the worker session instead: takeover, no receipt.
+  listSnapshot.byId['w-2'].pendingInteraction = null;
+  listSnapshot.byId['w-2'].running = false;
+  takeoverTask.sentAt = Date.now() - 10000;
+  w2Events = []; // no assistant output of ours got processed before the human stepped in
+  w2LastSeq = 30;
+  w2LastAssistantSeq = 20;
+  w2LastEnd = { turn: 3, reason: 'stop' };
+  eventHandlers['w-2'] = (cursor) => ({
+    ok: true,
+    sessionId: 'w-2',
+    events: w2Events.filter((e) => e.seq > cursor),
+    humanMessages: 1,
+    lastSeq: w2LastSeq,
+    lastAssistantSeq: w2LastAssistantSeq,
+    lastEnd: w2LastEnd,
+  });
+  const promptsBeforeTakeover = calls.prompts.filter((p) => p.id === 'c-1').length;
+  await client.poll(); // flag flip tick
+  await client.poll(); // settle tick
+  if (takeoverTask.status !== 'taken-over') throw new Error('takeover status wrong: ' + takeoverTask.status);
+  if (calls.prompts.filter((p) => p.id === 'c-1').length !== promptsBeforeTakeover) throw new Error('takeover must NOT inject a receipt');
+  console.log('OK: stuck flag mirrors pending interactions; a human takeover suppresses the receipt');
+
+  // --- engine flow G: manual cancel + retry ---
+  client.state.commanders.get('c-1').lastBatchAt = 0;
+  c1Events.push({ seq: 170, time: 16, turn: 7, text: '<dsh-dispatch target="#1">做E</dsh-dispatch>' });
+  c1LastSeq = 171;
+  c1LastAssistantSeq = 170;
+  listSnapshot.byId['w-1'].running = true;
+  await client.poll();
+  const cancelTaskRow = [...client.state.tasks.values()].find((t) => t.excerpt === '做E');
+  await client.cancelTask(cancelTaskRow.id);
+  if (!calls.cancels.includes('w-1') || cancelTaskRow.cancelRequested !== true) throw new Error('cancel flow wrong');
+  listSnapshot.byId['w-1'].running = false;
+  cancelTaskRow.sentAt = Date.now() - 10000;
+  w1Events.push({ seq: 80, time: 17, turn: 5, text: '' });
+  w1LastSeq = 81;
+  w1LastEnd = { turn: 5, reason: 'aborted' };
+  await client.poll();
+  await client.poll();
+  if (cancelTaskRow.status !== 'failed' || cancelTaskRow.detail.indexOf('已手动取消') === -1) {
+    throw new Error('cancelled settle wrong: ' + JSON.stringify({ status: cancelTaskRow.status, detail: cancelTaskRow.detail }));
+  }
+  const promptsBeforeRetry = calls.prompts.length;
+  await client.retryTask(cancelTaskRow.id);
+  const retryRow = [...client.state.tasks.values()].find((t) => t.fullText === '做E' && t.id !== cancelTaskRow.id);
+  if (retryRow === undefined || retryRow.workerId !== 'w-1' || retryRow.status !== 'running') throw new Error('retry task wrong: ' + JSON.stringify(retryRow ?? null));
+  if (calls.prompts.length !== promptsBeforeRetry + 1 || calls.prompts[calls.prompts.length - 1].content[0].text !== '做E') throw new Error('retry prompt wrong');
+  console.log('OK: cancel flags the worker turn; retry re-sends the same full text to the same worker');
+
+  // --- persistence: tasks mirrored into localStorage ---
+  const storedTasks = JSON.parse(storageMap.get('dsh-commander.tasks'));
+  if (!Array.isArray(storedTasks) || storedTasks.length < 5) throw new Error('tasks storage missing: ' + storedTasks.length);
+  if (!storedTasks.some((t) => typeof t.fullText === 'string' && t.fullText !== '')) throw new Error('fullText not persisted');
+  if (!storedTasks.some((t) => typeof t.batchId === 'string' && t.batchId !== '')) throw new Error('batchId not persisted');
+  console.log('OK: task history persists to localStorage with full text + batch ids');
+
   // --- cleanup: stop everything so no timer keeps the process alive ---
   for (const t of client.state.tasks.values()) {
     if (t.status === 'running' || t.status === 'sending') t.status = 'done';
@@ -536,9 +682,11 @@ async function clientTests() {
   if (client.hasOutstanding()) throw new Error('no outstanding tasks expected at cleanup');
   console.log('OK: deactivation clears the commander');
 
-  // --- SSR: inactive button vs active badge + panel ---
+  // --- SSR: inactive button vs active badge + panel + global pill ---
   const serverRenderer = require(path.join(harnessModules, 'react-dom/server'));
   const snapshot = { sessionId: 's-9' };
+  const emptyGlobalHtml = serverRenderer.renderToString(react.createElement(client.GlobalIndicator));
+  if (emptyGlobalHtml !== '') throw new Error('global indicator must render nothing without active commanders');
   const inactiveHtml = serverRenderer.renderToString(react.createElement(client.HeaderCommander, {
     useSession: (sel) => sel(snapshot),
   }));
@@ -553,12 +701,14 @@ async function clientTests() {
     }));
     if (activeHtml.indexOf('data-active="true"') === -1) throw new Error('active SSR must show the accent badge');
     if (activeHtml.indexOf('指挥官面板') === -1 || activeHtml.indexOf('花名册') === -1) throw new Error('active SSR must render the panel');
+    const globalHtml = serverRenderer.renderToString(react.createElement(client.GlobalIndicator));
+    if (globalHtml.indexOf('data-commander-global') === -1 || globalHtml.indexOf('指挥官') === -1) throw new Error('global indicator SSR wrong: ' + globalHtml);
   } finally {
     client.state.active.pop();
     client.state.commanders.delete('s-9');
     client.state.panelOpenFor = null;
   }
-  console.log('OK: client SSR renders inactive button and active badge + panel');
+  console.log('OK: client SSR renders inactive button, active badge + panel, and the global pill');
 }
 
 async function main() {
