@@ -289,12 +289,13 @@ async function clientTests() {
 
   // Sessions runtime mock: list snapshot store + lazy bindings + create().
   const listSnapshot = {
-    ids: ['c-1', 'w-1', 'w-2', 'blank'],
+    ids: ['c-1', 'w-1', 'w-2', 'blank', 'c-2'],
     byId: {
       'c-1': { id: 'c-1', displayTitle: '指挥官会话', title: '', cwd: 'D:/proj', running: false, completed: false, blank: false },
-      'w-1': { id: 'w-1', displayTitle: 'Worker A', title: '', cwd: 'D:/proj', running: true, completed: false, blank: false },
+      'w-1': { id: 'w-1', displayTitle: 'Worker A', title: '', cwd: 'D:/proj', running: false, completed: false, blank: false },
       'w-2': { id: 'w-2', displayTitle: 'Worker B', title: '', cwd: 'D:/proj', running: false, completed: false, blank: false },
       blank: { id: 'blank', displayTitle: '空白', blank: true },
+      'c-2': { id: 'c-2', displayTitle: '指挥官二号', title: '', cwd: 'D:/proj2', running: false, completed: false, blank: false },
     },
     current: 'c-1',
   };
@@ -317,7 +318,7 @@ async function clientTests() {
     async create(opts) {
       calls.createOpts.push(opts);
       listSnapshot.ids.push('session-new');
-      listSnapshot.byId['session-new'] = { id: 'session-new', displayTitle: 'session-new', running: true, blank: false };
+      listSnapshot.byId['session-new'] = { id: 'session-new', displayTitle: 'session-new', running: false, blank: false };
       addFace('session-new');
       return 'session-new';
     },
@@ -478,16 +479,16 @@ async function clientTests() {
   await client.activate('c-1');
   if (calls.inject.length !== 1) throw new Error('activation must inject one briefing');
   if (calls.inject[0].sessionId !== 'c-1') throw new Error('briefing sent to wrong session');
-  if (calls.inject[0].text.indexOf('#1 「Worker A」') === -1) throw new Error('briefing missing roster line');
-  if (calls.inject[0].text.indexOf('#2 「Worker B」') === -1 || calls.inject[0].text.indexOf('target="all"') === -1) throw new Error('briefing missing second roster line / broadcast syntax');
+  if (calls.inject[0].text.indexOf('#2 「Worker A」') === -1) throw new Error('briefing missing roster line');
+  if (calls.inject[0].text.indexOf('#3 「Worker B」') === -1 || calls.inject[0].text.indexOf('target="all"') === -1) throw new Error('briefing missing second roster line / broadcast syntax');
   let record = client.state.commanders.get('c-1');
   if (record === undefined || record.cursor !== 100) throw new Error('activation cursor wrong: ' + (record && record.cursor));
-  if (record.roster.length !== 2 || record.roster[0].id !== 'w-1' || record.roster[1].alias !== '#2') throw new Error('activation roster wrong');
+  if (record.roster.length !== 3 || record.roster[0].id !== 'c-2' || record.roster[0].alias !== '#1' || record.roster[1].id !== 'w-1' || record.roster[2].id !== 'w-2') throw new Error('activation roster wrong: ' + JSON.stringify(record.roster));
   if (!client.state.active.includes('c-1')) throw new Error('active list wrong');
   console.log('OK: activate injects the briefing and pins the cursor to the tail');
 
   // --- engine flow B: dispatch to an aliased worker ---
-  c1Events = [{ seq: 120, time: 9, turn: 2, text: '<dsh-dispatch target="#1">做任务A</dsh-dispatch>' }];
+  c1Events = [{ seq: 120, time: 9, turn: 2, text: '<dsh-dispatch target="#2">做任务A</dsh-dispatch>' }];
   c1LastSeq = 130;
   c1LastAssistantSeq = 120;
   c1LastEnd = { turn: 2, reason: 'stop' };
@@ -522,7 +523,7 @@ async function clientTests() {
   const taskRows = [...client.state.tasks.values()];
   if (taskRows.length !== 1) throw new Error('one task expected: ' + taskRows.length);
   const task = taskRows[0];
-  if (task.status !== 'running' || task.workerId !== 'w-1' || task.workerTitle !== 'Worker A' || task.alias !== '#1') {
+  if (task.status !== 'running' || task.workerId !== 'w-1' || task.workerTitle !== 'Worker A' || task.alias !== '#2') {
     throw new Error('dispatch result wrong: ' + JSON.stringify(task));
   }
   const dispatchPrompt = calls.prompts.find((p) => p.id === 'w-1');
@@ -531,7 +532,7 @@ async function clientTests() {
   if (record.cursor !== 130 || record.dispatchedTotal !== 1 || client.countOutstanding('c-1') !== 1) {
     throw new Error('engine counters wrong: ' + JSON.stringify({ cursor: record.cursor, total: record.dispatchedTotal }));
   }
-  console.log('OK: poll parses the block, resolves alias #1 -> w-1, delivers the queued task');
+  console.log('OK: poll parses the block, resolves alias #2 -> w-1, delivers the queued task');
 
   // --- engine flow C: settle on idle + receipt back into the commander ---
   listSnapshot.byId['w-1'].running = false;
@@ -568,11 +569,9 @@ async function clientTests() {
 
   // --- engine flow E: broadcast to two workers + batch roll-up summary ---
   client.state.commanders.get('c-1').lastBatchAt = 0;
-  c1Events.push({ seq: 150, time: 13, turn: 5, text: '<dsh-dispatch target="#1,#2">并行做C</dsh-dispatch>' });
+  c1Events.push({ seq: 150, time: 13, turn: 5, text: '<dsh-dispatch target="#2,#3">并行做C</dsh-dispatch>' });
   c1LastSeq = 151;
   c1LastAssistantSeq = 150;
-  listSnapshot.byId['w-1'].running = true;
-  listSnapshot.byId['w-2'].running = true;
   await client.poll();
   const waveC = [...client.state.tasks.values()].filter((t) => t.excerpt === '并行做C');
   if (waveC.length !== 2 || !waveC.every((t) => t.workerId === 'w-1' || t.workerId === 'w-2')) throw new Error('broadcast dispatch wrong: ' + JSON.stringify(waveC));
@@ -604,10 +603,9 @@ async function clientTests() {
 
   // --- engine flow F: stuck flag + human takeover (NO receipt) ---
   client.state.commanders.get('c-1').lastBatchAt = 0;
-  c1Events.push({ seq: 160, time: 15, turn: 6, text: '<dsh-dispatch target="#2">做D</dsh-dispatch>' });
+  c1Events.push({ seq: 160, time: 15, turn: 6, text: '<dsh-dispatch target="#3">做D</dsh-dispatch>' });
   c1LastSeq = 161;
   c1LastAssistantSeq = 160;
-  listSnapshot.byId['w-2'].running = true;
   await client.poll();
   const takeoverTask = [...client.state.tasks.values()].find((t) => t.excerpt === '做D');
   if (takeoverTask === undefined || takeoverTask.status !== 'running') throw new Error('takeover setup wrong');
@@ -641,10 +639,9 @@ async function clientTests() {
 
   // --- engine flow G: manual cancel + retry ---
   client.state.commanders.get('c-1').lastBatchAt = 0;
-  c1Events.push({ seq: 170, time: 16, turn: 7, text: '<dsh-dispatch target="#1">做E</dsh-dispatch>' });
+  c1Events.push({ seq: 170, time: 16, turn: 7, text: '<dsh-dispatch target="#2">做E</dsh-dispatch>' });
   c1LastSeq = 171;
   c1LastAssistantSeq = 170;
-  listSnapshot.byId['w-1'].running = true;
   await client.poll();
   const cancelTaskRow = [...client.state.tasks.values()].find((t) => t.excerpt === '做E');
   await client.cancelTask(cancelTaskRow.id);
@@ -666,6 +663,65 @@ async function clientTests() {
   if (calls.prompts.length !== promptsBeforeRetry + 1 || calls.prompts[calls.prompts.length - 1].content[0].text !== '做E') throw new Error('retry prompt wrong');
   console.log('OK: cancel flags the worker turn; retry re-sends the same full text to the same worker');
 
+  // Settle the retried task so flow H starts from an idle worker slot.
+  listSnapshot.byId['w-1'].running = false;
+  retryRow.sentAt = Date.now() - 10000;
+  w1Events.push({ seq: 85, time: 18, turn: 6, text: 'E补跑完成' });
+  w1LastSeq = 86;
+  w1LastAssistantSeq = 85;
+  w1LastEnd = { turn: 6, reason: 'stop' };
+  await client.poll();
+  if (retryRow.status !== 'done') throw new Error('retry settle wrong: ' + JSON.stringify(retryRow));
+
+  // --- engine flow H: same-worker serialization fixes receipt attribution ---
+  client.state.commanders.get('c-1').lastBatchAt = 0;
+  c1Events.push({ seq: 180, time: 18, turn: 8, text: '<dsh-dispatch target="#2">先做F</dsh-dispatch><dsh-dispatch target="#2">后做G</dsh-dispatch>' });
+  c1LastSeq = 181;
+  c1LastAssistantSeq = 180;
+  await client.poll();
+  const taskF = [...client.state.tasks.values()].find((t) => t.excerpt === '先做F');
+  const taskG = [...client.state.tasks.values()].find((t) => t.excerpt === '后做G');
+  if (taskF === undefined || taskG === undefined) throw new Error('flow H tasks missing');
+  if (taskF.status !== 'running' || taskG.status !== 'waiting' || taskG.workerId !== 'w-1') {
+    throw new Error('serialization wrong: ' + JSON.stringify({ f: taskF.status, g: taskG.status, fd: taskF.detail, gd: taskG.detail, fw: taskF.workerId, gw: taskG.workerId }));
+  }
+  if (calls.prompts.some((p) => p.id === 'w-1' && p.content[0].text === '后做G')) throw new Error('second task must NOT send while the slot is held');
+  // Settle F; its lock release must promote G with a FRESH baseline.
+  taskF.sentAt = Date.now() - 10000;
+  w1Events.push({ seq: 90, time: 19, turn: 9, text: 'F结果' });
+  w1LastSeq = 91;
+  w1LastAssistantSeq = 90;
+  w1LastEnd = { turn: 9, reason: 'stop' };
+  await client.poll();
+  if (taskF.status !== 'done' || !taskF.detail.includes('F结果')) throw new Error('F settle wrong: ' + JSON.stringify(taskF));
+  if (taskG.status !== 'running' || taskG.baseline !== 90) throw new Error('promotion wrong: ' + JSON.stringify({ s: taskG.status, b: taskG.baseline }));
+  if (calls.prompts.filter((p) => p.id === 'w-1' && p.content[0].text === '后做G').length !== 1) throw new Error('G prompt missing');
+  taskG.sentAt = Date.now() - 10000;
+  w1Events.push({ seq: 95, time: 20, turn: 10, text: 'G结果' });
+  w1LastSeq = 96;
+  w1LastAssistantSeq = 95;
+  w1LastEnd = { turn: 10, reason: 'stop' };
+  await client.poll();
+  if (taskG.status !== 'done' || !taskG.detail.includes('G结果')) throw new Error('G settle misattributed: ' + taskG.detail);
+  console.log('OK: same-worker tasks serialize with fresh baselines — receipts attributed correctly');
+
+  // --- engine flow I: cross-commander hop guard ---
+  eventHandlers['c-2'] = () => ({ ok: true, sessionId: 'c-2', events: [], humanMessages: 0, lastSeq: 5, lastAssistantSeq: 5, lastEnd: null });
+  await client.activate('c-2'); // roster of BOTH commanders now includes each other
+  record = client.state.commanders.get('c-1');
+  record.lastBatchAt = 0;
+  record.commanderHops = 99; // exhaust the budget deterministically
+  c1Events.push({ seq: 190, time: 21, turn: 11, text: '<dsh-dispatch target="#1">跨指挥官任务</dsh-dispatch>' });
+  c1LastSeq = 191;
+  c1LastAssistantSeq = 190;
+  await client.poll();
+  const hopTask = [...client.state.tasks.values()].find((t) => t.excerpt === '跨指挥官任务');
+  if (hopTask === undefined || hopTask.status !== 'failed' || hopTask.detail.indexOf('跨指挥官派发已达上限') === -1) {
+    throw new Error('hop guard wrong: ' + JSON.stringify(hopTask ?? null));
+  }
+  if (calls.prompts.some((p) => p.id === 'c-2')) throw new Error('hopped dispatch must not reach the other commander');
+  console.log('OK: cross-commander hops are budgeted and blocked at the cap');
+
   // --- persistence: tasks mirrored into localStorage ---
   const storedTasks = JSON.parse(storageMap.get('dsh-commander.tasks'));
   if (!Array.isArray(storedTasks) || storedTasks.length < 5) throw new Error('tasks storage missing: ' + storedTasks.length);
@@ -677,6 +733,7 @@ async function clientTests() {
   for (const t of client.state.tasks.values()) {
     if (t.status === 'running' || t.status === 'sending') t.status = 'done';
   }
+  client.deactivate('c-2');
   client.deactivate('c-1');
   if (client.state.active.length !== 0) throw new Error('deactivate must clear the active list');
   if (client.hasOutstanding()) throw new Error('no outstanding tasks expected at cleanup');
