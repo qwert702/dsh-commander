@@ -478,10 +478,10 @@ async function clientTests() {
   }
   if (loader.id !== 'dsh-commander') throw new Error('wrong bundle id: ' + loader.id);
   const client = loader.exports;
-  if (client.inject.length !== 2 || client.inject[0] !== 'slots' || client.inject[1] !== 'sessions') {
+  if (client.inject.length !== 3 || client.inject[0] !== 'slots' || client.inject[1] !== 'sessions' || client.inject[2] !== 'remote') {
     throw new Error('wrong client inject: ' + JSON.stringify(client.inject));
   }
-  console.log('OK: client bundle loads, inject slots+sessions');
+  console.log('OK: client bundle loads, inject slots+sessions+remote');
 
   // --- registration via apply() ---
   const entries = [];
@@ -501,6 +501,11 @@ async function clientTests() {
   if (!injectedSeats.includes('shell.overlay')) throw new Error('shell.overlay seat not injected (global indicator)');
   const overlay = entries.find((e) => e.opts.name === 'shell.overlay');
   if (overlay === undefined || overlay.opts.id !== 'dsh-commander-global') throw new Error('global indicator entry wrong: ' + JSON.stringify(overlay?.opts));
+  if (!injectedSeats.includes('settings.section')) throw new Error('settings.section seat not injected (native settings page)');
+  const sectionEntry = entries.find((e) => e.opts.name === 'settings.section');
+  if (sectionEntry === undefined || sectionEntry.opts.id !== 'dsh-commander' || sectionEntry.opts.label !== '指挥官') {
+    throw new Error('settings section opts wrong: ' + JSON.stringify(sectionEntry?.opts));
+  }
   if (client.state.booted !== true) throw new Error('engine not booted by apply()');
   console.log('OK: client registers both seats and boots the engine');
 
@@ -543,6 +548,12 @@ async function clientTests() {
   if (verdict.action !== 'cap' || String(verdict.reason).indexOf('并发') === -1) throw new Error('outstanding cap wrong');
   verdict = client.evaluateBatch(many, { outstanding: 0, dispatchedTotal: 50 }, cfg);
   if (verdict.action !== 'cap' || String(verdict.reason).indexOf('累计派发已达上限') === -1) throw new Error('activation cap wrong');
+  // Auto-create burst cap: "一次性最多开几个对话"
+  const autoMany = [1, 2, 3, 4].map((i) => ({ target: '', title: '', task: 'auto' + String(i) }));
+  verdict = client.evaluateBatch(autoMany, { outstanding: 0, dispatchedTotal: 0 }, { ...cfg, maxOutstanding: 16, maxNewWorkersPerBatch: 3 });
+  if (verdict.action !== 'execute' || verdict.items.length !== 3 || verdict.autoDropped !== 1 || verdict.dropped !== 0) throw new Error('auto-create cap wrong: ' + JSON.stringify(verdict));
+  verdict = client.evaluateBatch(autoMany, { outstanding: 0, dispatchedTotal: 0 }, { ...cfg, maxOutstanding: 16, maxNewWorkersPerBatch: 0 });
+  if (verdict.action !== 'execute' || verdict.items.length !== 0 || verdict.autoDropped !== 4) throw new Error('auto-create zero-cap wrong: ' + JSON.stringify(verdict));
   console.log('OK: evaluateBatch covers every branch');
 
   // --- roster + briefing ---
@@ -572,12 +583,12 @@ async function clientTests() {
   console.log('OK: buildRoster + briefingText');
 
   // --- config normalization + loading ---
-  let normalized = client.normalizeConfig({ enabled: 'yes', pollIntervalMs: 1, autoReport: false, stuckTimeoutMs: 1, autoLabelWorkers: false });
-  if (normalized.enabled !== false || normalized.pollIntervalMs !== 500 || normalized.autoReport !== false || normalized.stuckTimeoutMs !== 30000 || normalized.autoLabelWorkers !== false) {
+  let normalized = client.normalizeConfig({ enabled: 'yes', pollIntervalMs: 1, autoReport: false, stuckTimeoutMs: 1, autoLabelWorkers: false, maxNewWorkersPerBatch: 99 });
+  if (normalized.enabled !== false || normalized.pollIntervalMs !== 500 || normalized.autoReport !== false || normalized.stuckTimeoutMs !== 30000 || normalized.autoLabelWorkers !== false || normalized.maxNewWorkersPerBatch !== 16) {
     throw new Error('normalize wrong: ' + JSON.stringify(normalized));
   }
   normalized = client.normalizeConfig({});
-  if (normalized.maxOutstanding !== 5 || normalized.autoReport !== true || normalized.maxTaskChars !== 4000 || normalized.stuckTimeoutMs !== 600000 || normalized.autoLabelWorkers !== true) throw new Error('normalize defaults wrong');
+  if (normalized.maxOutstanding !== 5 || normalized.autoReport !== true || normalized.maxTaskChars !== 4000 || normalized.stuckTimeoutMs !== 600000 || normalized.autoLabelWorkers !== true || normalized.maxNewWorkersPerBatch !== 3) throw new Error('normalize defaults wrong');
 
   configPayload = { ok: true, config: { enabled: false, maxOutstanding: 7 } };
   let loaded = await client.loadConfig();
