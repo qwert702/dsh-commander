@@ -1154,6 +1154,54 @@ async function clientTests() {
   console.log('OK: session-not-found probes fail fast without retries');
 
 
+  // --- engine flow Q: reload reconciliation rebuilds queues, dep gates, batch dedupe ---
+  record.lastBatchAt = 0;
+  listSnapshot.byId['w-2'].running = true;
+  c1Events.push({ seq: 260, time: 37, turn: 18, text: '<dsh-dispatch target="#3">重载排队任务</dsh-dispatch>' });
+  c1LastSeq = 261;
+  c1LastAssistantSeq = 260;
+  await client.poll();
+  const reloadWait = [...client.state.tasks.values()].find((t) => t.excerpt === '重载排队任务');
+  if (reloadWait === undefined || reloadWait.status !== 'waiting') throw new Error('Q waiting setup wrong');
+  const gates = client.__gates();
+  gates.waitQueue.delete('w-2'); // 模拟旧页面：FIFO 随页面消亡
+  await client.reconcileRestoredTasks();
+  if (!(gates.waitQueue.get('w-2') ?? []).includes(reloadWait.id)) throw new Error('waiting requeue wrong');
+  listSnapshot.byId['w-2'].running = false;
+  await client.poll(); // promotion tick — probe runs under the lock HERE
+  // Result lands AFTER the send (baseline was probed inside the lock).
+  w2Events.push({ seq: 95, time: 38, turn: 13, text: '重载完成' });
+  w2LastSeq = 96; w2LastAssistantSeq = 95; w2LastEnd = { turn: 13, reason: 'stop' };
+  reloadWait.sentAt = Date.now() - 10000;
+  await client.poll(); // settle with the fresh tail
+  if (reloadWait.status !== 'done' || reloadWait.detail.indexOf('重载完成') === -1) throw new Error('Q queued settle wrong');
+  // dep-gate rebuild: wipe the waiter index, predecessor settles while away
+  record.lastBatchAt = 0;
+  c1Events.push({ seq: 270, time: 39, turn: 19, text: '<dsh-dispatch tid="rl-a" target="#2">RL前序</dsh-dispatch><dsh-dispatch tid="rl-b" depends="rl-a" target="#3">RL后续</dsh-dispatch>' });
+  c1LastSeq = 271; c1LastAssistantSeq = 270;
+  await client.poll();
+  const rlA = [...client.state.tasks.values()].find((t) => t.excerpt === 'RL前序');
+  const rlB = [...client.state.tasks.values()].find((t) => t.excerpt === 'RL后续');
+  if (rlA === undefined || rlB === undefined || rlA.status !== 'running' || rlB.status !== 'blocked-dep') throw new Error('Q dep setup wrong: ' + JSON.stringify([rlA && rlA.status, rlB && rlB.status]));
+  gates.depIndex.clear(); // 模拟旧页面：等待者索引随页面消亡
+  listSnapshot.byId['w-1'].running = false;
+  rlA.sentAt = Date.now() - 10000;
+  w1Events.push({ seq: 115, time: 40, turn: 14, text: 'RL前序完成' });
+  w1LastSeq = 116; w1LastAssistantSeq = 115; w1LastEnd = { turn: 14, reason: 'stop' };
+  await client.poll(); // 前序结算；索引已空，无人被解锁
+  if (rlB.status !== 'blocked-dep') throw new Error('rlB must stay parked while index is gone: ' + rlB.status);
+  await client.reconcileRestoredTasks(); // 对账：前序已完成 → 立即晋升
+  if (rlB.status !== 'running') throw new Error('dep reconcile promote wrong: ' + rlB.status);
+  // batch dedupe: reconciliation itself must not fire historical summaries
+  const summariesBefore = calls.prompts.filter((p) => p.id === 'c-1' && p.content[0].text.indexOf('[指挥官批次汇总') !== -1).length;
+  rlB.sentAt = Date.now() - 10000;
+  w2Events.push({ seq: 100, time: 41, turn: 14, text: 'RL后续完成' });
+  w2LastSeq = 101; w2LastAssistantSeq = 100; w2LastEnd = { turn: 14, reason: 'stop' };
+  await client.poll(); await client.poll();
+  if (rlB.status !== 'done') throw new Error('rlB settle wrong: ' + JSON.stringify(rlB.detail));
+  const summariesAfter = calls.prompts.filter((p) => p.id === 'c-1' && p.content[0].text.indexOf('[指挥官批次汇总') !== -1).length;
+  if (summariesAfter < summariesBefore) throw new Error('summaries lost');
+  console.log('OK: reload reconciliation requeues waiters, rebuilds dep gates, never re-reports history');
   // --- manual dispatch / report / notifications ---
   const directBefore = calls.prompts.length;
   await client.directDispatch('c-1', { target: '#2', task: '手动直派任务' });
