@@ -27,7 +27,8 @@
     }
   },
   "scripts": {
-    "test": "node test/smoke.cjs"
+    "test": "node test/smoke.cjs",
+    "soak": "node test/soak.cjs"
   },
   "license": "MIT"
 }

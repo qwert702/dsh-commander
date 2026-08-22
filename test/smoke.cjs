@@ -1293,6 +1293,12 @@ async function clientTests() {
     client.state.panelOpenFor = null;
   }
   console.log('OK: client SSR renders inactive button, active badge + panel, and the global pill');
+
+  // --- settings section SSR: fields + stats render from resolved config ---
+  const sectionHtml = serverRenderer.renderToString(react.createElement(client.CommanderSettingsSection));
+  if (sectionHtml.indexOf('一次最多开几个对话') === -1) throw new Error('settings section SSR missing field label');
+  if (sectionHtml.indexOf('任务统计') === -1 && sectionHtml.indexOf('暂无任务统计') === -1) throw new Error('settings section SSR missing stats block');
+  console.log('OK: settings section SSR renders fields + stats block');
 }
 
 async function main() {
