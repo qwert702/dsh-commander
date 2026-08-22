@@ -904,6 +904,60 @@ async function clientTests() {
   }
   console.log('OK: dependencies referencing nothing fail fast');
 
+  // --- engine flow M: interrupted worker turns auto-continue to completion ---
+  record.lastBatchAt = 0;
+  c1Events.push({ seq: 230, time: 30, turn: 15, text: '<dsh-dispatch target="#3">中断恢复任务</dsh-dispatch>' }); // '#3' = w-2
+  c1LastSeq = 231;
+  c1LastAssistantSeq = 230;
+  await client.poll();
+  const fragTask = [...client.state.tasks.values()].find((t) => t.excerpt === '中断恢复任务');
+  if (fragTask === undefined || fragTask.status !== 'running') throw new Error('flow M dispatch wrong: ' + JSON.stringify(fragTask ?? null));
+  // First turn dies ABORTED with only partial output.
+  w2Events.push({ seq: 70, time: 31, turn: 9, text: '部分结果' });
+  w2LastSeq = 71;
+  w2LastAssistantSeq = 70;
+  w2LastEnd = { turn: 9, reason: 'aborted' };
+  fragTask.sentAt = Date.now() - 10000;
+  await client.poll(); // resume tick
+  if (fragTask.status !== 'running' || fragTask.continuations !== 1) {
+    throw new Error('interrupted task must auto-continue: ' + JSON.stringify({ s: fragTask.status, c: fragTask.continuations }));
+  }
+  if (!calls.prompts.some((p) => p.id === 'w-2' && p.content[0].text.indexOf('完成任务前被中断') !== -1)) {
+    throw new Error('resume prompt missing');
+  }
+  // The continuation turn finishes normally; baseline never moved → aggregate BOTH segments.
+  w2Events.push({ seq: 75, time: 32, turn: 10, text: '最终结果' });
+  w2LastSeq = 76;
+  w2LastAssistantSeq = 75;
+  w2LastEnd = { turn: 10, reason: 'stop' };
+  fragTask.sentAt = Date.now() - 10000;
+  await client.poll();
+  if (fragTask.status !== 'done') throw new Error('flow M settle wrong: ' + fragTask.status);
+  if (fragTask.detail.indexOf('部分结果') === -1 || fragTask.detail.indexOf('最终结果') === -1) {
+    throw new Error('resumed receipt must aggregate both segments: ' + fragTask.detail);
+  }
+  if (fragTask.detail.indexOf('续跑 1 次') === -1) throw new Error('continuation note missing: ' + fragTask.detail);
+  console.log('OK: interrupted turns auto-continue and receipts aggregate pre/post interruption');
+
+  // --- exhaustion: maxContinuations=0 keeps today's fail-fast semantics ---
+  record.lastBatchAt = 0;
+  client.state.config.maxContinuations = 0;
+  c1Events.push({ seq: 240, time: 33, turn: 16, text: '<dsh-dispatch target="#3">不续跑任务</dsh-dispatch>' });
+  c1LastSeq = 241;
+  c1LastAssistantSeq = 240;
+  await client.poll();
+  const noResumeTask = [...client.state.tasks.values()].find((t) => t.excerpt === '不续跑任务');
+  w2Events.push({ seq: 80, time: 34, turn: 11, text: '' });
+  w2LastSeq = 81;
+  w2LastEnd = { turn: 11, reason: 'error' };
+  noResumeTask.sentAt = Date.now() - 10000;
+  await client.poll();
+  if (noResumeTask.status !== 'failed' || noResumeTask.detail.indexOf('回合异常结束') === -1 || noResumeTask.continuations !== 0) {
+    throw new Error('exhaustion wrong: ' + JSON.stringify({ s: noResumeTask.status, c: noResumeTask.continuations, d: noResumeTask.detail }));
+  }
+  client.state.config.maxContinuations = 2;
+  console.log('OK: interruption budget is configurable — 0 restores pure fail-fast');
+
   // --- manual dispatch / report / notifications ---
   const directBefore = calls.prompts.length;
   await client.directDispatch('c-1', { target: '#2', task: '手动直派任务' });
