@@ -1010,6 +1010,32 @@ async function clientTests() {
   client.state.config.maxContinuations = 2;
   console.log('OK: interruption budget is configurable — 0 restores pure fail-fast');
 
+  // --- engine flow N: 强发 bypasses a stale-busy worker flag ---
+  record.lastBatchAt = 0;
+  listSnapshot.byId['w-2'].running = true; // stale "busy" marker with nothing actually pending
+  c1Events.push({ seq: 245, time: 35, turn: 17, text: '<dsh-dispatch target="#3">强发任务</dsh-dispatch>' }); // '#3' = w-2
+  c1LastSeq = 246;
+  c1LastAssistantSeq = 245;
+  await client.poll();
+  const stuckTask = [...client.state.tasks.values()].find((t) => t.excerpt === '强发任务');
+  if (stuckTask === undefined || stuckTask.status !== 'waiting') throw new Error('force setup wrong: ' + JSON.stringify(stuckTask ?? null));
+  const promptsBeforeForce = calls.prompts.filter((p) => p.id === 'w-2').length;
+  await client.forceDispatchWaiting(stuckTask.id);
+  if (stuckTask.status !== 'running') throw new Error('force dispatch wrong: ' + stuckTask.status);
+  if (calls.prompts.filter((p) => p.id === 'w-2').length !== promptsBeforeForce + 1) throw new Error('forced prompt missing');
+  if (stuckTask.sentAt <= Date.now() - 5000) throw new Error('forced send must refresh sentAt');
+  listSnapshot.byId['w-2'].running = false;
+  stuckTask.sentAt = Date.now() - 10000;
+  w2Events.push({ seq: 85, time: 36, turn: 12, text: '强发完成' });
+  w2LastSeq = 86;
+  w2LastAssistantSeq = 85;
+  w2LastEnd = { turn: 12, reason: 'stop' };
+  await client.poll();
+  if (stuckTask.status !== 'done' || stuckTask.detail.indexOf('强发完成') === -1) {
+    throw new Error('forced settle wrong: ' + JSON.stringify({ s: stuckTask.status, d: stuckTask.detail }));
+  }
+  console.log('OK: 强发 bypasses a stale-busy flag while keeping lock FIFO');
+
 
   // --- manual dispatch / report / notifications ---
   const directBefore = calls.prompts.length;
