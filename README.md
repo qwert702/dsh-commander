@@ -41,7 +41,8 @@ DeepSeek Harness Web GUI 的**指挥官**插件：把任意一个对话升级成
 - **人工接管检测**：worker 的 baseline 之后若出现真人消息（非插件注入），该任务标记「已接管」并**不再自动回执**——避免和正在亲自操作的人抢话。
 - **全局悬浮指示器**：任何会话右下角都有小挂件列出各激活指挥官及其进行中任务数，点击直达对应会话——人在别处干活也不漏进度。
 - **后台桌面通知**：标签页在后台时，批次结算/任务失败/worker 卡住会发系统通知（首次激活时请求权限）。
-- **任务历史持久化**：任务表实时镜像到 localStorage（保留最近 100 条），页面刷新后自动恢复；未完成任务由监视器重新结算补发回执。激活状态同样持久化，恢复时游标钉在最新尾部，历史输出绝不重复执行。
+- **重启不丢指挥官**：激活状态双写持久——浏览器 localStorage（页面刷新恢复）+ host 端 `<dsh-home>/dsh-commander/registry.json`（**harness 重启、换端口、换浏览器都照常恢复**）。引擎启动时合并两个来源，会话仍存在的指挥官自动重新上岗（游标钉在最新尾部，历史输出绝不重复执行）。
+- **任务历史持久化**：任务表实时镜像到 localStorage（保留最近 100 条），页面刷新后自动恢复；未完成任务由监视器重新结算补发回执。
 - **后台运行**：引擎挂在模块层而不是组件层——轮询走 host 事件日志路由，**不依赖当前浏览器停留在哪个对话**。
 
 ## 安全护栏
@@ -53,10 +54,11 @@ DeepSeek Harness Web GUI 的**指挥官**插件：把任意一个对话升级成
 
 ## 工作原理
 
-1. **host 半区**（`lib/index.js`）：设置命名空间 `dsh-commander` + 三条路由：
-   - `GET /api/dsh-commander/config` — 解析后的配置；
+1. **host 半区**（`lib/index.js`）：设置命名空间 `dsh-commander` + 四条路由：
+   - `GET /api/dsh-commander/config` — 解析后的配置（POST 为设置面板白名单写回）；
    - `POST /api/dsh-commander/inject {sessionId,text}` — 把简报作为一条 plugin 来源的 user 消息静默追加进会话（context-compressor 同款 checkpoint 手法，不开回合）；
-   - `GET /api/dsh-commander/events?sessionId&cursor&limit` — 只读投影：cursor 之后已定型的 assistant 文本 + 最后一个 `turn/end` 原因 + cursor 之后**真人消息计数**（接管信号）+ 全日志尾部锚点。
+   - `GET /api/dsh-commander/events?sessionId&cursor&limit` — 只读投影：cursor 之后已定型的 assistant 文本 + 最后一个 `turn/end` 原因 + cursor 之后**真人消息计数**（接管信号）+ 全日志尾部锚点；
+   - `GET|POST /api/dsh-commander/registry` — 持久指挥官注册表（`~/.dsh/dsh-commander/registry.json`），重启存活的关键。
 2. **浏览器半区**（`lib/client.js`）：模块级引擎单例以 ~2s 轮询每个激活指挥官的 events 尾部 → 正则解析 `<dsh-dispatch>` 块 → 广播展开（`#1,#2` / `all`）→ 纯函数策略闸门（并发/条数/累计上限）→ 经客户端 sessions 运行时 `binding(target).prompt(task,'queue')` 送达（或 `create({cwd})` 新建）→ 订阅 `sessions.list` 快照监视 worker 的 running 标志与 pendingInteraction（侧边栏同源信号）→ 结算后把回执 prompt 回指挥官；整批结算再补一条批次汇总。
 3. **UI**：两个增量坐席——`conversation.session.header.actions`（徽章+面板，与家族其他插件同款）与 `shell.overlay`（全局悬浮指示器），不替换任何原厂组合。
 

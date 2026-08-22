@@ -16,6 +16,9 @@
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
+const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-cmdr-home-'));
+process.env.DSH_HOME = tempHome; // registry writes land in a disposable dir during tests
 
 const pkg = path.resolve(__dirname, '..');
 const bundle = path.join(pkg, 'lib/client.js');
@@ -60,6 +63,8 @@ function assert(condition, message) {
 
 // --- 2. host route tests ---
 async function hostTests() {
+  // Durable registry must land OUTSIDE the repo: pin DSH_HOME before import.
+  process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-cmdr-test-'));
   const host = await import('file:///' + hostFile.replace(/\\/g, '/'));
   if (host.name !== 'dsh-commander-host') throw new Error('bad host name: ' + host.name);
   for (const service of ['webServer', 'settings', 'sessions']) {
@@ -115,11 +120,11 @@ async function hostTests() {
 
   const routeByPath = {};
   for (const route of registeredRoutes) routeByPath[route.path] = route;
-  for (const p of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events']) {
+  for (const p of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', '/api/dsh-commander/registry']) {
     if (routeByPath[p] === undefined) throw new Error('route not registered: ' + p);
     if (routeByPath[p].kind !== 'exact') throw new Error('wrong kind for ' + p + ': ' + JSON.stringify(routeByPath[p]));
   }
-  console.log('OK: host registers the three routes');
+  console.log('OK: host registers the four routes');
 
   function fakeRes() {
     let status = 0;
@@ -292,6 +297,36 @@ async function hostTests() {
   parsed = f.json();
   if (parsed.events.length !== 1 || parsed.events[0].seq !== 3) throw new Error('events limit clamp wrong');
   console.log('OK: host events route (validation matrix + tail projection + anchors)');
+
+  // --- registry route (durable commander set, survives harness restarts) ---
+  const registryRoute = routeByPath['/api/dsh-commander/registry'];
+  f = fakeRes();
+  await registryRoute.handler({ method: 'GET', url: '/api/dsh-commander/registry' }, f.res);
+  if (f.json().ok !== true || f.json().ids.length !== 0) throw new Error('registry must start empty: ' + f.body());
+  f = fakeRes();
+  await registryRoute.handler(makeReq('POST', '/api/dsh-commander/registry', { sessionId: 'session-9', active: true }), f.res);
+  if (f.status() !== 200 || f.json().ok !== true) throw new Error('registry add wrong: ' + f.body());
+  f = fakeRes();
+  await registryRoute.handler(makeReq('POST', '/api/dsh-commander/registry', { sessionId: 'session-8', active: true }), f.res);
+  if (f.status() !== 200) throw new Error('registry add-2 wrong');
+  // Duplicate adds are idempotent.
+  await registryRoute.handler(makeReq('POST', '/api/dsh-commander/registry', { sessionId: 'session-8', active: true }), fakeRes().res);
+  f = fakeRes();
+  await registryRoute.handler(makeReq('POST', '/api/dsh-commander/registry', { sessionId: 'session-9', active: false }), f.res);
+  if (f.json().ok !== true) throw new Error('registry remove wrong');
+  f = fakeRes();
+  await registryRoute.handler({ method: 'GET', url: '/api/dsh-commander/registry' }, f.res);
+  if (JSON.stringify(f.json().ids) !== JSON.stringify(['session-8'])) throw new Error('registry persistence wrong: ' + f.body());
+  const regFile = path.join(process.env.DSH_HOME, 'dsh-commander', 'registry.json');
+  if (!fs.existsSync(regFile)) throw new Error('registry file missing under DSH_HOME: ' + regFile);
+  if (!fs.readFileSync(regFile, 'utf8').includes('"sessionId": "session-8"')) throw new Error('registry file content wrong');
+  f = fakeRes();
+  await registryRoute.handler(makeReq('POST', '/api/dsh-commander/registry', { sessionId: '', active: true }), f.res);
+  if (f.status() !== 400) throw new Error('registry validation wrong: ' + f.body());
+  f = fakeRes();
+  await registryRoute.handler(makeReq('POST', '/api/dsh-commander/registry', { sessionId: 'x' }), f.res);
+  if (f.status() !== 400) throw new Error('registry validation-2 wrong');
+  console.log('OK: durable commander registry (add/idempotent/remove/persist/validation)');
 }
 
 // --- 3. client bundle tests ---
@@ -309,7 +344,7 @@ async function clientTests() {
 
   // Fetch mock routing by URL; per-session event handlers respect the cursor
   // so repeated polls are idempotent exactly like the real host route.
-  const calls = { inject: [], prompts: [], renames: [], createOpts: [], cancels: [], forkOpts: [] };
+  const calls = { inject: [], prompts: [], renames: [], createOpts: [], cancels: [], forkOpts: [], registryPosts: [] };
   let configPayload = { ok: true, config: { enabled: true } };
   const eventHandlers = {};
 
@@ -320,6 +355,13 @@ async function clientTests() {
   global.fetch = async (url, opts) => {
     const u = String(url);
     if (u.includes('/api/dsh-commander/config')) return jsonResponse(configPayload);
+    if (u.includes('/api/dsh-commander/registry')) {
+      if ((opts?.method ?? 'GET') === 'POST') {
+        calls.registryPosts.push(JSON.parse(opts.body));
+        return jsonResponse({ ok: true });
+      }
+      return jsonResponse({ ok: true, ids: [] });
+    }
     if (u.includes('/api/dsh-commander/inject')) {
       calls.inject.push(JSON.parse(opts.body));
       return jsonResponse({ ok: true, seq: 5 });
@@ -533,6 +575,9 @@ async function clientTests() {
   if (record === undefined || record.cursor !== 100) throw new Error('activation cursor wrong: ' + (record && record.cursor));
   if (record.roster.length !== 3 || record.roster[0].id !== 'c-2' || record.roster[0].alias !== '#1' || record.roster[1].id !== 'w-1' || record.roster[2].id !== 'w-2') throw new Error('activation roster wrong: ' + JSON.stringify(record.roster));
   if (!client.state.active.includes('c-1')) throw new Error('active list wrong');
+  if (!calls.registryPosts.some((p) => p.sessionId === 'c-1' && p.active === true)) {
+    throw new Error('activation must persist to the durable host registry: ' + JSON.stringify(calls.registryPosts));
+  }
   console.log('OK: activate injects the briefing and pins the cursor to the tail');
 
   // --- engine flow B: dispatch to an aliased worker ---
@@ -1006,7 +1051,10 @@ async function clientTests() {
   client.deactivate('c-1');
   if (client.state.active.length !== 0) throw new Error('deactivate must clear the active list');
   if (client.hasOutstanding()) throw new Error('no outstanding tasks expected at cleanup');
-  console.log('OK: deactivation clears the commander');
+  // Activation changes must be mirrored into the durable host registry.
+  if (!calls.registryPosts.some((p) => p.sessionId === 'c-1' && p.active === true)) throw new Error('registry add post missing');
+  if (!calls.registryPosts.some((p) => p.sessionId === 'c-1' && p.active === false)) throw new Error('registry remove post missing');
+  console.log('OK: deactivation clears the commander and syncs the durable registry');
 
   // --- SSR: inactive button vs active badge + panel + global pill ---
   const serverRenderer = require(path.join(harnessModules, 'react-dom/server'));
