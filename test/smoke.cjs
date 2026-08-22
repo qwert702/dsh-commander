@@ -48,7 +48,7 @@ console.log('OK: node --check passed (client.js + index.js)');
 function sanityChecks() {
   const host = fs.readFileSync(hostFile, 'utf8');
   const client = fs.readFileSync(bundle, 'utf8');
-  for (const marker of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', '/api/dsh-commander/fullresult', 'WRITABLE_KEYS', 'projectAssistantTail', 'pickFailoverCandidate']) {
+  for (const marker of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', '/api/dsh-commander/fullresult', 'WRITABLE_KEYS', 'projectAssistantTail', 'pickFailoverCandidate', 'settings.section', 'maxNewWorkersPerBatch', 'confirmDispatch']) {
     if (host.indexOf(marker) === -1) throw new Error('host missing marker: ' + marker);
   }
   for (const marker of ['workerLocks', 'sendOrQueue', 'drainWaitingQueues', 'expandBlocks', 'directDispatch', 'buildReportText', 'updateConfig', 'GlobalIndicator', 'shell.overlay']) {
