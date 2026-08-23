@@ -1,4 +1,4 @@
-# dsh-commander
+# dsh-commander v2.0
 
 DeepSeek Harness Web GUI 的**指挥官**插件：把任意一个对话升级成「指挥官」，它的模型可以在回复里派发任务给其他对话（worker）并行执行；插件自动送达任务、监视 worker、把结果摘要以「回执」注入指挥官会话，形成无人值守的多窗口协作闭环。
 

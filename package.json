@@ -1,6 +1,6 @@
 {
   "name": "dsh-commander",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "description": "Commander for the DeepSeek Harness Web GUI: activate any conversation as the commander, and its model can dispatch tasks to other conversations via <dsh-dispatch> protocol blocks. The plugin parses the blocks, delivers each task to a target (or freshly created) worker session, watches the workers, and feeds result summaries back into the commander as receipts so it keeps orchestrating.",
   "type": "module",
   "main": "lib/index.js",
