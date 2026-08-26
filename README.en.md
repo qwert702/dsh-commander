@@ -35,8 +35,14 @@ closed, supervised delegation loop.
   can never cross streams), automatic resume of interrupted turns
   (`maxContinuations`), automatic reassignment of failed tasks to the least
   loaded idle worker (`maxFailovers`, budget inherited down the chain),
-  human-takeover detection that suppresses receipts, manual cancel/retry/
-  force-send escape hatches.
+  human-presence detection that by default does NOT interrupt tasks (a
+  「人工在场」 badge is shown instead; opt into the legacy takeover semantics
+  with `takeoverOnHuman`, which pairs with the `takeoverFollow` read-only
+  watch that streams each later turn of a human-driven worker back as
+  「[指挥官观察]」 progress notes), manual cancel/retry/
+  force-send escape hatches, and `dedupDispatch` duplicate-task interception
+  (same-text re-dispatch keeps ONE copy and notifies the commander; explicit
+  single-block broadcasts are exempt).
 
 - **Feedback loop** — receipts carry status, duration, token usage, changed
   files (projected from write/edit tool calls) and a truncated summary; a

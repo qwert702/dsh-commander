@@ -753,11 +753,55 @@ async function clientTests() {
   }
   console.log('OK: broadcast delivers to both workers and rolls the batch up into one summary');
 
+  // --- engine flow E2: duplicate-task correction (dedupDispatch default ON) ---
+  client.state.commanders.get('c-1').lastBatchAt = 0;
+  c1Events.push({ seq: 155, time: 15, turn: 6, text: '<dsh-dispatch target="#2">做E</dsh-dispatch><dsh-dispatch target="#3">做E</dsh-dispatch>' });
+  c1LastSeq = 156;
+  c1LastAssistantSeq = 155;
+  const promptsBeforeE2 = calls.prompts.filter((p) => p.id === 'c-1').length;
+  await client.poll();
+  if ([...client.state.tasks.values()].filter((t) => t.excerpt === '做E').length !== 1) {
+    throw new Error('intra-reply dedup must keep exactly ONE 做E');
+  }
+  // Same job AGAIN while still running: active-task dedup + visible notice.
+  client.state.commanders.get('c-1').lastBatchAt = 0;
+  c1Events.push({ seq: 158, time: 16, turn: 7, text: '<dsh-dispatch target="#3">做E</dsh-dispatch>' });
+  c1LastSeq = 159;
+  c1LastAssistantSeq = 158;
+  await client.poll();
+  if ([...client.state.tasks.values()].filter((t) => t.excerpt === '做E').length !== 1) {
+    throw new Error('active-task dedup must not create a second 做E');
+  }
+  const e2notes = calls.prompts.filter((p) => p.id === 'c-1').slice(promptsBeforeE2);
+  if (!e2notes.some((p) => p.content[0].text.includes('[指挥官提示]') && p.content[0].text.includes('重复'))) {
+    throw new Error('dedup notice missing: ' + JSON.stringify(e2notes.map((p) => p.content[0].text)));
+  }
+  console.log('OK: duplicate tasks are corrected (one copy kept, commander notified)');
+  // Settle 做E so following flows start with a clean worker-lock slate.
+  listSnapshot.byId['w-1'].running = false;
+  const eTask = [...client.state.tasks.values()].find((t) => t.excerpt === '做E');
+  eTask.sentAt = Date.now() - 10000;
+  w1Events.push({ seq: 80, time: 17, turn: 5, text: 'E结果' });
+  w1LastSeq = 81;
+  w1LastAssistantSeq = 80;
+  w1LastEnd = { turn: 5, reason: 'stop' };
+  await client.poll();
+  if (eTask.status !== 'done') throw new Error('做E settle wrong: ' + eTask.status);
+  // History dedup: re-sending an ALREADY COMPLETED task must not re-run it.
+  client.state.commanders.get('c-1').lastBatchAt = 0;
+  c1Events.push({ seq: 163, time: 18, turn: 8, text: '<dsh-dispatch target="#2">做E</dsh-dispatch>' });
+  c1LastSeq = 164;
+  c1LastAssistantSeq = 163;
+  await client.poll();
+  if ([...client.state.tasks.values()].filter((t) => t.excerpt === '做E').length !== 1) {
+    throw new Error('history dedup must not re-run a finished 做E');
+  }
+
   // --- engine flow F: stuck flag + human takeover (NO receipt) ---
   client.state.commanders.get('c-1').lastBatchAt = 0;
-  c1Events.push({ seq: 160, time: 15, turn: 6, text: '<dsh-dispatch target="#3">做D</dsh-dispatch>' });
-  c1LastSeq = 161;
-  c1LastAssistantSeq = 160;
+  c1Events.push({ seq: 170, time: 19, turn: 9, text: '<dsh-dispatch target="#3">做D</dsh-dispatch>' });
+  c1LastSeq = 171;
+  c1LastAssistantSeq = 170;
   await client.poll();
   const takeoverTask = [...client.state.tasks.values()].find((t) => t.excerpt === '做D');
   if (takeoverTask === undefined || takeoverTask.status !== 'running') throw new Error('takeover setup wrong');
@@ -766,6 +810,9 @@ async function clientTests() {
   await client.poll();
   if (takeoverTask.stuck !== true) throw new Error('stuck flag not set');
   // The human answers IN the worker session instead: takeover, no receipt.
+  // (takeoverOnHuman defaults to false — human chatter must NOT kill tasks —
+  //  so this scenario explicitly opts into the legacy takeover semantics.)
+  client.state.config.takeoverOnHuman = true;
   listSnapshot.byId['w-2'].pendingInteraction = null;
   listSnapshot.byId['w-2'].running = false;
   takeoverTask.sentAt = Date.now() - 10000;
