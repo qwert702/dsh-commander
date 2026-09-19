@@ -1,4 +1,4 @@
-# dsh-commander
+# dsh-commander (v2.1, harness >= 0.1.6)
 
 Multi-conversation orchestration for the DeepSeek Harness Web GUI: promote any
 conversation to **commander**, and its model can dispatch tasks to other

@@ -1,6 +1,8 @@
-# dsh-commander v2.0
+# dsh-commander v2.1
 
 DeepSeek Harness Web GUI 的**指挥官**插件：把任意一个对话升级成「指挥官」，它的模型可以在回复里派发任务给其他对话（worker）并行执行；插件自动送达任务、监视 worker、把结果摘要以「回执」注入指挥官会话，形成无人值守的多窗口协作闭环。
+
+> **v2.1 适配 harness ≥ 0.1.6**：host 半区注入 `llm` 服务（新版沙箱 ctx 只暴露 inject 声明过的服务，此前圆桌讨论会被守卫直接拒绝）；`<dsh-mail>` 协作提示正式接入简报与任务提示（`mailHintOnDispatch`）；新增跨源写保护、配置写回数值钳制、registry/mailbox 写锁、git 超时与 Windows 大小写锁键、确认模式挂起批持久化、放行时并发复查、徽章计数含排队任务、以及审计遗留清单中多项修复。详见 CHANGELOG。
 
 > **一键安装：**
 > ```
@@ -111,7 +113,7 @@ dsh-commander:
 
 ## 仓库布局
 
-- `lib/index.js` — 插件 host 半区：设置命名空间 + 注入/事件两条路由。
+- `lib/index.js` — 插件 host 半区：设置命名空间 + 注入/事件/全文/注册表/邮箱/git/圆桌八条路由。
 - `lib/client.js` — 浏览器半区：协议解析、广播展开、策略闸门、花名册、引擎（激活/轮询/派发/监视/回执/批次汇总/取消重试）、头部徽章面板、全局指示器（手写 bundle，与家族其他插件同技术路线）。
 - `test/smoke.cjs` — `node test/smoke.cjs`：语法检查 + host 四路由全分支（校验矩阵/checkpoint 追加/尾投影锚点/真人消息计数/设置写回白名单/持久注册表）+ client 纯函数与完整编排回路（激活→派发→结算回执→自动新建→广播+批次汇总→同 worker 串行化归因→跳数防护→fork 继承→tid/depends 依赖链→用量聚合→人工接管→中断续跑→取消重试→强发→直派→报告→通知节流→持久化）+ SSR 断言。无 harness 安装时（CI）自动降级为语法+结构标记检查。
 - `.github/workflows/smoke.yml` — push/PR 自动跑冒烟（windows-latest，无私有依赖也能过）。

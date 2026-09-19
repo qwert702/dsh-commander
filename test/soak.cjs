@@ -16,6 +16,16 @@ const localNodeModules = path.join(pkg, 'node_modules');
 if (!fs.existsSync(localNodeModules) && fs.existsSync(harnessModules)) {
   fs.symlinkSync(harnessModules, localNodeModules, 'junction');
 }
+// Newer harness installs ship no react in profiles/node_modules; resolve from
+// the plugin's own devDependencies as a fallback.
+function resolveReact(sub) {
+  for (const base of [localNodeModules, harnessModules]) {
+    try {
+      return require(path.join(base, sub));
+    } catch {}
+  }
+  throw new Error('cannot resolve ' + sub + ' — run npm install');
+}
 
 const CYCLES = Number(process.env.SOAK_CYCLES ?? 60);
 let seed = Number(process.env.SOAK_SEED ?? 20260823);
@@ -121,8 +131,8 @@ global.window = {
   __ModuleLoader__: {
     load(entry) {
       loader.exports = entry.factory((spec) => {
-        if (spec === 'react') return require(path.join(harnessModules, 'react'));
-        if (spec === 'react/jsx-runtime') return require(path.join(harnessModules, 'react/jsx-runtime'));
+        if (spec === 'react') return resolveReact('react');
+        if (spec === 'react/jsx-runtime') return resolveReact('react/jsx-runtime');
         throw new Error('unexpected require ' + spec);
       });
     },

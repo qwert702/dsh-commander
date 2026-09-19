@@ -27,12 +27,39 @@ const hostFile = path.join(pkg, 'lib/index.js');
 // The host half imports harness packages. When this checkout has no
 // node_modules (fresh clone), junction the harness install's node_modules
 // from $DSH_HARNESS_NODE_MODULES so the smoke test still runs against a real
-// install.
+// install. When node_modules IS a real npm install (devDependencies), only
+// the private @deepseek-ai scope is junctioned in from the harness.
 const localNodeModules = path.join(pkg, 'node_modules');
 const harnessModules = process.env.DSH_HARNESS_NODE_MODULES ?? 'C:/Users/cbn/.dsh/profiles/node_modules';
 if (!fs.existsSync(localNodeModules) && fs.existsSync(harnessModules)) {
   fs.symlinkSync(harnessModules, localNodeModules, 'junction');
 }
+// Newer harness installs no longer ship react into profiles/node_modules (the
+// web frontend prebundles it), so react comes from the plugin's own
+// devDependencies; the private harness scope is then what needs linking.
+const harnessScope = path.join(harnessModules, '@deepseek-ai');
+const scopeLink = path.join(localNodeModules, '@deepseek-ai');
+if (fs.existsSync(localNodeModules) && !fs.existsSync(scopeLink) && fs.existsSync(harnessScope)) {
+  try { fs.symlinkSync(harnessScope, scopeLink, 'junction'); } catch {}
+}
+
+/** First candidate path that require() can actually load, or undefined. */
+function resolveFirst(...candidates) {
+  for (const candidate of candidates) {
+    try {
+      require.resolve(candidate);
+      return candidate;
+    } catch {}
+  }
+  return undefined;
+}
+// harnessAvailable gates the functional halves: CI / fresh clones have no
+// private packages and fall back to structural checks only.
+const harnessAvailable = fs.existsSync(path.join(harnessModules, '@deepseek-ai', 'dsh-llm'))
+  || (() => { try { require.resolve('@deepseek-ai/dsh-llm', { paths: [pkg] }); return true; } catch { return false; } })();
+const reactPath = resolveFirst(path.join(localNodeModules, 'react'), path.join(harnessModules, 'react'));
+const jsxRuntimePath = resolveFirst(path.join(localNodeModules, 'react/jsx-runtime'), path.join(harnessModules, 'react/jsx-runtime'));
+const reactDomServerPath = resolveFirst(path.join(localNodeModules, 'react-dom/server'), path.join(harnessModules, 'react-dom/server'));
 
 // --- 1. syntax ---
 execFileSync(process.execPath, ['--check', bundle], { stdio: 'inherit' });
@@ -51,7 +78,7 @@ function sanityChecks() {
   for (const marker of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', '/api/dsh-commander/fullresult', 'WRITABLE_KEYS', 'projectAssistantTail', 'pickFailoverCandidate', 'settings.section', 'maxNewWorkersPerBatch', 'confirmDispatch']) {
     if (host.indexOf(marker) === -1) throw new Error('host missing marker: ' + marker);
   }
-  for (const marker of ['workerLocks', 'sendOrQueue', 'drainWaitingQueues', 'expandBlocks', 'directDispatch', 'buildReportText', 'updateConfig', 'GlobalIndicator', 'shell.overlay']) {
+  for (const marker of ['workerLocks', 'sendOrQueue', 'drainWaitingQueues', 'expandBlocks', 'directDispatch', 'buildReportText', 'updateConfig', 'GlobalIndicator', 'shell.overlay', 'dsh-mail', 'dedupKeyOf', 'pollEpoch', 'workerMailHint', 'STORAGE_AWAITING']) {
     if (client.indexOf(marker) === -1) throw new Error('client missing marker: ' + marker);
   }
   console.log('OK: structural markers present (syntax-only CI mode)');
@@ -67,7 +94,7 @@ async function hostTests() {
   process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-cmdr-test-'));
   const host = await import('file:///' + hostFile.replace(/\\/g, '/'));
   if (host.name !== 'dsh-commander-host') throw new Error('bad host name: ' + host.name);
-  for (const service of ['webServer', 'settings', 'sessions']) {
+  for (const service of ['webServer', 'settings', 'sessions', 'llm']) {
     if (!host.inject.includes(service)) throw new Error('host missing inject: ' + service);
   }
 
@@ -140,11 +167,12 @@ async function hostTests() {
     };
   }
 
-  function makeReq(method, url, payload) {
+  function makeReq(method, url, payload, headers) {
     const text = payload === undefined ? '' : (typeof payload === 'string' ? payload : JSON.stringify(payload));
     return {
       method,
       url,
+      headers: headers ?? {},
       async *[Symbol.asyncIterator]() {
         if (text !== '') yield Buffer.from(text, 'utf8');
       },
@@ -179,6 +207,22 @@ async function hostTests() {
     throw new Error('whitelist filter wrong: ' + JSON.stringify(configPatches[0]));
   }
   if (namespaceConfig.pollIntervalMs !== 3000 || namespaceConfig.autoReport !== false) throw new Error('patch not persisted into namespace');
+  // Numeric clamps: a rogue patch cannot park the engine with out-of-range values.
+  f = fakeRes();
+  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', { patch: { maxOutstanding: 9999, pollIntervalMs: 0 } }), f.res);
+  if (configPatches[configPatches.length - 1].maxOutstanding !== 32 || configPatches[configPatches.length - 1].pollIntervalMs !== 500) {
+    throw new Error('config clamp wrong: ' + JSON.stringify(configPatches[configPatches.length - 1]));
+  }
+  // CSRF gate: a cross-origin POST must be rejected on every mutating route.
+  f = fakeRes();
+  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', { patch: { maxOutstanding: 3 } }, { origin: 'http://evil.example', host: '127.0.0.1:8080' }), f.res);
+  if (f.status() !== 403 || f.json().error.code !== 'cross-origin') throw new Error('config cross-origin must 403: ' + f.body());
+  f = fakeRes();
+  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', { patch: { maxOutstanding: 3 } }, { origin: 'http://127.0.0.1:8080', host: '127.0.0.1:8080' }), f.res);
+  if (f.status() !== 200) throw new Error('same-origin POST must pass: ' + f.body());
+  f = fakeRes();
+  await routeByPath['/api/dsh-commander/inject'].handler(makeReq('POST', '/api/dsh-commander/inject', { sessionId: 'c-1', text: 'x' }, { origin: 'http://evil.example', host: '127.0.0.1:8080' }), f.res);
+  if (f.status() !== 403) throw new Error('inject cross-origin must 403');
   f = fakeRes();
   await routeByPath['/api/dsh-commander/config'].handler({ method: 'PATCH', url: '/api/dsh-commander/config' }, f.res);
   if (f.status() !== 405) throw new Error('config PATCH must 405: status=' + f.status());
@@ -369,12 +413,117 @@ async function hostTests() {
   await registryRoute.handler(makeReq('POST', '/api/dsh-commander/registry', { sessionId: 'x' }), f.res);
   if (f.status() !== 400) throw new Error('registry validation-2 wrong');
   console.log('OK: durable commander registry (add/idempotent/remove/persist/validation)');
+
+  // --- mail route (worker collaboration mailbox) ---
+  const mailRoute = routeByPath['/api/dsh-commander/mail'];
+  if (mailRoute === undefined) throw new Error('mail route not registered');
+  f = fakeRes();
+  await mailRoute.handler(makeReq('GET', '/api/dsh-commander/mail'), f.res);
+  if (f.status() !== 400) throw new Error('mail GET missing box must 400');
+  f = fakeRes();
+  await mailRoute.handler(makeReq('POST', '/api/dsh-commander/mail', { from: 'a', to: [], body: 'x' }), f.res);
+  if (f.status() !== 400) throw new Error('mail missing recipients must 400');
+  const mailIds = [];
+  for (let i = 0; i < 2; i++) {
+    f = fakeRes();
+    await mailRoute.handler(makeReq('POST', '/api/dsh-commander/mail', { from: 'w-1', to: ['w-2'], subject: '接口', body: '消息' + String(i) }), f.res);
+    if (f.status() !== 200 || f.json().ok !== true) throw new Error('mail deliver wrong: ' + f.body());
+    mailIds.push(f.json().id);
+  }
+  if (mailIds[0] === mailIds[1]) throw new Error('mail ids must be unique within the same millisecond');
+  f = fakeRes();
+  await mailRoute.handler(makeReq('GET', '/api/dsh-commander/mail?box=w-2'), f.res);
+  parsed = f.json();
+  if (parsed.ok !== true || parsed.inbox.length !== 2 || parsed.unread !== 2) throw new Error('mail inbox wrong: ' + f.body());
+  f = fakeRes();
+  await mailRoute.handler(makeReq('POST', '/api/dsh-commander/mail', { op: 'read', box: 'w-2', mailIds }), f.res);
+  if (f.json().ok !== true) throw new Error('mail read-op wrong');
+  f = fakeRes();
+  await mailRoute.handler(makeReq('GET', '/api/dsh-commander/mail?box=w-2'), f.res);
+  if (f.json().unread !== 0) throw new Error('mail unread must drop after read');
+  f = fakeRes();
+  await mailRoute.handler(makeReq('POST', '/api/dsh-commander/mail', { from: 'w-1', to: ['w-2'], body: 'x'.repeat(8 * 1024 + 1) }), f.res);
+  if (f.status() !== 413) throw new Error('mail oversized body must 413');
+  namespaceConfig = { enabled: false };
+  f = fakeRes();
+  await mailRoute.handler(makeReq('POST', '/api/dsh-commander/mail', { from: 'w-1', to: ['w-2'], body: 'x' }), f.res);
+  if (f.status() !== 200 || f.json().ok !== false || f.json().error.code !== 'disabled') throw new Error('mail disabled gate wrong');
+  namespaceConfig = null;
+  f = fakeRes();
+  await mailRoute.handler(makeReq('POST', '/api/dsh-commander/mail', { from: 'w-1', to: ['w-2'], body: 'x' }, { origin: 'http://evil.example', host: '127.0.0.1:8080' }), f.res);
+  if (f.status() !== 403) throw new Error('mail cross-origin must 403');
+  console.log('OK: mail route (deliver/read/inbox/unique ids/size+enabled+origin gates)');
+
+  // --- git route (validation only: never touches a real repo here) ---
+  const gitRoute = routeByPath['/api/dsh-commander/git'];
+  if (gitRoute === undefined) throw new Error('git route not registered');
+  f = fakeRes();
+  await gitRoute.handler(makeReq('GET', '/api/dsh-commander/git'), f.res);
+  if (f.status() !== 405) throw new Error('git GET must 405');
+  f = fakeRes();
+  await gitRoute.handler(makeReq('POST', '/api/dsh-commander/git', { op: 'nope' }), f.res);
+  if (f.status() !== 400) throw new Error('git unknown op must 400: ' + f.body());
+  namespaceConfig = { enabled: false };
+  f = fakeRes();
+  await gitRoute.handler(makeReq('POST', '/api/dsh-commander/git', { op: 'nope' }), f.res);
+  if (f.status() !== 200 || f.json().ok !== false || f.json().error.code !== 'disabled') throw new Error('git disabled gate wrong: ' + f.body());
+  namespaceConfig = null;
+  console.log('OK: git route (method/unknown-op/disabled gating)');
+
+  // --- roundtable route (two-round debate over the injected llm service) ---
+  const rtRoute = routeByPath['/api/dsh-commander/roundtable'];
+  if (rtRoute === undefined) throw new Error('roundtable route not registered');
+  f = fakeRes();
+  await rtRoute.handler(makeReq('GET', '/api/dsh-commander/roundtable'), f.res);
+  if (f.status() !== 405) throw new Error('roundtable GET must 405');
+  f = fakeRes();
+  await rtRoute.handler(makeReq('POST', '/api/dsh-commander/roundtable', { topic: '', body: 'x' }), f.res);
+  if (f.status() !== 400) throw new Error('roundtable missing topic must 400');
+  let llmCalls = 0;
+  const llmMock = {
+    async *stream(options) {
+      llmCalls += 1;
+      const text = JSON.stringify(options.messages?.[0]?.content ?? '').includes('第二轮') ? '第二轮结论' + String(llmCalls) : '第一轮观点' + String(llmCalls);
+      yield { type: 'block-start', index: 0, blockType: 'text' };
+      yield { type: 'text-delta', index: 0, text };
+    },
+  };
+  // The routes registered above closed over the ORIGINAL ctx object — rebuild
+  // the route handler by re-applying with an llm-bearing context.
+  const rtRoutes = [];
+  host.apply({
+    effect(fn) { fn(); },
+    inject(services, cb) {
+      cb({
+        settings: {
+          register: () => ({
+            get: () => ({ enabled: true }),
+            async update() {},
+          }),
+        },
+      });
+    },
+    webServer: { register(route) { rtRoutes.push(route); } },
+    sessions: { get() { return undefined; }, flush() {} },
+    llm: llmMock,
+  });
+  const rtRoute2 = rtRoutes.find((r) => r.path === '/api/dsh-commander/roundtable');
+  f = fakeRes();
+  await rtRoute2.handler(makeReq('POST', '/api/dsh-commander/roundtable', { topic: '方案', body: '背景材料', count: 3 }), f.res);
+  parsed = f.json();
+  if (f.status() !== 200 || parsed.ok !== true || parsed.participants !== 3) throw new Error('roundtable happy wrong: ' + f.body());
+  // 3 first-round analyses + 3 cross-reviews.
+  if (llmCalls !== 6) throw new Error('roundtable must make 3+3 llm calls: ' + String(llmCalls));
+  if (parsed.minutes.indexOf('第一轮观点') === -1 || parsed.minutes.indexOf('第二轮结论') === -1 || parsed.minutes.indexOf('圆桌纪要') === -1) {
+    throw new Error('roundtable minutes wrong: ' + parsed.minutes.slice(0, 200));
+  }
+  console.log('OK: roundtable route (two-round debate, 6 parallel llm calls, minutes assembled)');
 }
 
 // --- 3. client bundle tests ---
 async function clientTests() {
-  const react = require(path.join(harnessModules, 'react'));
-  const jsxRuntime = require(path.join(harnessModules, 'react/jsx-runtime'));
+  const react = require(reactPath);
+  const jsxRuntime = require(jsxRuntimePath);
 
   // localStorage mock BEFORE the bundle evaluates (boot reads persisted ids).
   const storageMap = new Map();
@@ -611,6 +760,50 @@ async function clientTests() {
   if (expanded.length !== 2) throw new Error('whitespace/empty-part expansion wrong: ' + JSON.stringify(expanded));
   console.log('OK: expandBlocks covers comma / all / passthrough');
 
+  // --- mail/roundtable parsing vs echoed examples ---
+  // A worker reciting the briefing's example must not fire a real mail; the
+  // exact briefing example body is ignored, and fenced blocks are stripped.
+  if (client.parseMailBlocks('<dsh-mail to="#2" subject="接口约定">消息内容</dsh-mail>').length !== 0) {
+    throw new Error('briefing example mail must be ignored');
+  }
+  if (client.parseMailBlocks('```xml\n<dsh-mail to="#2">真内容</dsh-mail>\n```').length !== 0) {
+    throw new Error('fenced mail must be ignored');
+  }
+  const realMail = client.parseMailBlocks('<dsh-mail to="#2,#3" subject="接口定了" leases="src/a.ts">我开始写 API 了</dsh-mail>');
+  if (realMail.length !== 1 || realMail[0].to !== '#2,#3' || realMail[0].leases.length !== 1) {
+    throw new Error('real mail parse wrong: ' + JSON.stringify(realMail));
+  }
+  if (client.parseRoundtableBlocks('```\n<dsh-roundtable topic="x">y</dsh-roundtable>\n```').length !== 0) {
+    throw new Error('fenced roundtable must be ignored');
+  }
+  // Dispatch parsing stays UNfenced: models sometimes fence real dispatches.
+  if (client.parseDispatchBlocks('```xml\n<dsh-dispatch target="#1">任务</dsh-dispatch>\n```').length !== 1) {
+    throw new Error('fenced dispatch must still parse');
+  }
+  console.log('OK: mail/roundtable parsing ignores echoes; dispatch parsing stays strict');
+
+  // --- dedup key alignment (admission text vs stored fullText) ---
+  client.state.config.maxTaskChars = 4000;
+  const longTask = '写一个很长的任务 ' + '内容段落 abc  '.repeat(600); // > 4000 chars, whitespace runs
+  const storedShape = client.truncateText(longTask, 4000);
+  if (client.dedupKeyOf(longTask) !== client.dedupKeyOf(storedShape)) {
+    throw new Error('dedup keys must agree between raw block text and stored truncated fullText');
+  }
+  console.log('OK: dedupKeyOf aligns admission-side and history-side keys');
+
+  // --- briefing mail hint wiring (mailHintOnDispatch) ---
+  client.state.config.mailHintOnDispatch = true;
+  if (client.briefingText(roster).indexOf('<dsh-mail') === -1) {
+    throw new Error('briefing must document the dsh-mail protocol when the hint is on');
+  }
+  client.state.config.mailHintOnDispatch = false;
+  if (client.briefingText(roster).indexOf('<dsh-mail') !== -1) {
+    throw new Error('briefing must omit the dsh-mail protocol when the hint is off');
+  }
+  if (client.workerMailHint() !== '') throw new Error('worker hint must vanish when mailHintOnDispatch is off');
+  client.state.config.mailHintOnDispatch = true;
+  console.log('OK: mailHintOnDispatch wires the collaboration hint into briefing + worker prompts');
+
   // --- engine flow A: activation ---
   let c1Events = [];
   let c1LastSeq = 100;
@@ -680,7 +873,11 @@ async function clientTests() {
   }
   const dispatchPrompt = calls.prompts.find((p) => p.id === 'w-1');
   if (dispatchPrompt === undefined) throw new Error('worker prompt missing');
-  if (dispatchPrompt.mode !== 'queue' || dispatchPrompt.content[0].text !== '做任务A') throw new Error('worker prompt payload wrong');
+  if (dispatchPrompt.mode !== 'queue' || !dispatchPrompt.content[0].text.startsWith('做任务A')) {
+    throw new Error('worker prompt payload wrong: ' + JSON.stringify(dispatchPrompt));
+  }
+  // The outgoing task prompt carries the <dsh-mail> collaboration hint (mailHintOnDispatch default ON).
+  if (dispatchPrompt.content[0].text.indexOf('<dsh-mail') === -1) throw new Error('worker mail hint missing from outgoing prompt');
   if (record.cursor !== 130 || record.dispatchedTotal !== 1 || client.countOutstanding('c-1') !== 1) {
     throw new Error('engine counters wrong: ' + JSON.stringify({ cursor: record.cursor, total: record.dispatchedTotal }));
   }
@@ -716,7 +913,7 @@ async function clientTests() {
   if (calls.createOpts.length !== 1 || calls.createOpts[0].cwd !== 'D:/proj') throw new Error('create opts wrong: ' + JSON.stringify(calls.createOpts));
   if (!calls.renames.some((r) => r.id === 'session-new' && r.title === '新窗口')) throw new Error('rename wrong: ' + JSON.stringify(calls.renames));
   const createdPrompt = calls.prompts.find((p) => p.id === 'session-new');
-  if (createdPrompt === undefined || createdPrompt.content[0].text !== '做B') throw new Error('created-worker prompt wrong');
+  if (createdPrompt === undefined || !createdPrompt.content[0].text.startsWith('做B')) throw new Error('created-worker prompt wrong');
   console.log('OK: omitted target auto-creates a worker with inherited cwd + rename');
 
   // --- engine flow E: broadcast to two workers + batch roll-up summary ---
@@ -727,7 +924,7 @@ async function clientTests() {
   await client.poll();
   const waveC = [...client.state.tasks.values()].filter((t) => t.excerpt === '并行做C');
   if (waveC.length !== 2 || !waveC.every((t) => t.workerId === 'w-1' || t.workerId === 'w-2')) throw new Error('broadcast dispatch wrong: ' + JSON.stringify(waveC));
-  if (calls.prompts.filter((p) => (p.id === 'w-1' || p.id === 'w-2') && p.content[0].text === '并行做C').length !== 2) {
+  if (calls.prompts.filter((p) => (p.id === 'w-1' || p.id === 'w-2') && p.content[0].text.startsWith('并行做C')).length !== 2) {
     throw new Error('broadcast must deliver the task to BOTH workers');
   }
   // Settle both workers; expect two receipts plus ONE consolidated batch report.
@@ -797,6 +994,41 @@ async function clientTests() {
     throw new Error('history dedup must not re-run a finished 做E');
   }
 
+  // --- engine flow E3: confirmation mode parks the batch; persistence + release ---
+  client.state.config.confirmDispatch = true;
+  client.state.commanders.get('c-1').lastBatchAt = 0;
+  c1Events.push({ seq: 166, time: 18, turn: 8, text: '<dsh-dispatch target="#2">做G确认流</dsh-dispatch>' });
+  c1LastSeq = 167;
+  c1LastAssistantSeq = 166;
+  await client.poll();
+  const parked = client.state.commanders.get('c-1').awaitingConfirm;
+  if (parked === undefined || parked.items.length !== 1 || parked.items[0].task !== '做G确认流') {
+    throw new Error('confirm mode must park the batch: ' + JSON.stringify(parked ?? null));
+  }
+  if ([...client.state.tasks.values()].some((t) => t.excerpt === '做G确认流')) throw new Error('parked batch must not create tasks');
+  const storedAwaiting = JSON.parse(storageMap.get('dsh-commander.awaiting') ?? '[]');
+  if (!storedAwaiting.some((e) => e.sessionId === 'c-1' && e.awaiting.items[0].task === '做G确认流')) {
+    throw new Error('parked batch must persist to localStorage: ' + storageMap.get('dsh-commander.awaiting'));
+  }
+  client.state.config.confirmDispatch = false;
+  await client.releaseAwaiting('c-1', true);
+  const gTask = [...client.state.tasks.values()].find((t) => t.excerpt === '做G确认流');
+  if (gTask === undefined || gTask.status !== 'running' || gTask.workerId !== 'w-1') {
+    throw new Error('released batch must dispatch: ' + JSON.stringify(gTask ?? null));
+  }
+  if (client.state.commanders.get('c-1').awaitingConfirm !== undefined) throw new Error('released batch must clear the park');
+  if (storageMap.get('dsh-commander.awaiting') !== '[]') throw new Error('released batch must clear storage');
+  console.log('OK: confirm mode parks + persists the batch and releases it on demand');
+  // Settle 做G so following flows start with a clean worker-lock slate.
+  listSnapshot.byId['w-1'].running = false;
+  gTask.sentAt = Date.now() - 10000;
+  w1Events.push({ seq: 90, time: 19, turn: 6, text: 'G结果' });
+  w1LastSeq = 91;
+  w1LastAssistantSeq = 90;
+  w1LastEnd = { turn: 6, reason: 'stop' };
+  await client.poll();
+  if (gTask.status !== 'done') throw new Error('做G settle wrong: ' + gTask.status);
+
   // --- engine flow F: stuck flag + human takeover (NO receipt) ---
   client.state.commanders.get('c-1').lastBatchAt = 0;
   c1Events.push({ seq: 170, time: 19, turn: 9, text: '<dsh-dispatch target="#3">做D</dsh-dispatch>' });
@@ -844,7 +1076,7 @@ async function clientTests() {
   if (manualTask === undefined || manualTask.workerId !== 'w-1' || manualTask.status !== 'running') {
     throw new Error('direct dispatch wrong: ' + JSON.stringify(manualTask ?? null));
   }
-  if (calls.prompts.length !== directBefore + 1 || calls.prompts[calls.prompts.length - 1].content[0].text !== '手动直派任务') {
+  if (calls.prompts.length !== directBefore + 1 || !calls.prompts[calls.prompts.length - 1].content[0].text.startsWith('手动直派任务')) {
     throw new Error('direct dispatch prompt wrong');
   }
   let emptyThrew = false;
@@ -891,7 +1123,7 @@ async function clientTests() {
   console.log('OK: deactivation clears the commander and syncs the durable registry');
 
   // --- SSR: inactive button vs active badge + panel + global pill ---
-  const serverRenderer = require(path.join(harnessModules, 'react-dom/server'));
+  const serverRenderer = require(reactDomServerPath);
   const snapshot = { sessionId: 's-9' };
   const emptyGlobalHtml = serverRenderer.renderToString(react.createElement(client.GlobalIndicator));
   if (emptyGlobalHtml !== '') throw new Error('global indicator must render nothing without active commanders');
@@ -926,13 +1158,17 @@ async function clientTests() {
 }
 
 async function main() {
-  if (!fs.existsSync(localNodeModules) && !fs.existsSync(harnessModules)) {
+  if (!harnessAvailable) {
     sanityChecks();
     console.log('all smoke tests passed (syntax-only mode)');
     return;
   }
   await hostTests();
-  await clientTests();
+  if (reactPath === undefined || jsxRuntimePath === undefined || reactDomServerPath === undefined) {
+    console.log('SKIP: client tests (react not resolvable — npm install brings it via devDependencies)');
+  } else {
+    await clientTests();
+  }
   console.log('all smoke tests passed');
 }
 
