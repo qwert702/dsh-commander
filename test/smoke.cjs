@@ -1,18 +1,19 @@
-// Smoke test for dsh-commander:
+// Smoke test for dsh-commander (harness 0.2.0 contract):
 // 1. node --check on lib/index.js + lib/client.js
-// 2. Host half: apply() registers the three routes; the config route resolves
-//    the settings namespace (defaults when absent, overrides when configured);
-//    the inject route appends ONE plugin-sourced user message into a live,
-//    idle session and fails closed on every bad input; the events route
-//    projects the settled assistant tail after a cursor plus the final
-//    turn/end fact and the log-wide tail anchor.
-// 3. Client bundle: the additive header.actions registration + engine boot;
-//    the pure protocol/policy/roster/config helpers across every branch; the
-//    full orchestration loop against a mocked fetch + sessions runtime
-//    (activate -> briefing injection -> parse & dispatch to an aliased worker
-//    -> settle on idle -> receipt back into the commander -> auto-created
-//    worker with inherited cwd + rename); and the SSR render of the header
-//    entry (inactive button, active badge + panel).
+// 2. Host half: exports name/inject/Config (the loader config channel — the
+//    0.1.x `settings.register()` namespace is gone); apply(ctx) / apply(ctx,
+//    config) resolve defaults ⊕ profile config ⊕ the plugin's own persisted
+//    panel-override layer; the inject route appends ONE plugin-sourced user
+//    message into a live, idle session and fails closed on every bad input;
+//    the events route projects the settled assistant tail after a cursor plus
+//    the final turn/end fact and the log-wide tail anchor.
+// 3. Client bundle: the additive header.actions / shell.overlay /
+//    settings.section registrations + engine boot against the 0.2.0 sessions
+//    runtime (binding() only for retained generations, retain/release around
+//    every prompt, uiWorkspace.openSession navigation, uiSession pending
+//    interactions); the pure protocol/policy/roster/config helpers across every
+//    branch; the full orchestration loop against a mocked fetch + sessions
+//    runtime; and the SSR render of every seat.
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -75,10 +76,10 @@ console.log('OK: node --check passed (client.js + index.js)');
 function sanityChecks() {
   const host = fs.readFileSync(hostFile, 'utf8');
   const client = fs.readFileSync(bundle, 'utf8');
-  for (const marker of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', '/api/dsh-commander/fullresult', 'WRITABLE_KEYS', 'projectAssistantTail', 'pickFailoverCandidate', 'settings.section', 'maxNewWorkersPerBatch', 'confirmDispatch']) {
+  for (const marker of ['/api/dsh-commander/config', '/api/dsh-commander/inject', '/api/dsh-commander/events', '/api/dsh-commander/fullresult', 'WRITABLE_KEYS', 'projectAssistantTail', 'pickFailoverCandidate', 'settings.section', 'maxNewWorkersPerBatch', 'confirmDispatch', 'snapshotEvents', 'PLUGIN_SOURCE_KIND', 'overrides.json', 'resolveLlmRoute']) {
     if (host.indexOf(marker) === -1) throw new Error('host missing marker: ' + marker);
   }
-  for (const marker of ['workerLocks', 'sendOrQueue', 'drainWaitingQueues', 'expandBlocks', 'directDispatch', 'buildReportText', 'updateConfig', 'GlobalIndicator', 'shell.overlay', 'dsh-mail', 'dedupKeyOf', 'pollEpoch', 'workerMailHint', 'STORAGE_AWAITING']) {
+  for (const marker of ['workerLocks', 'sendOrQueue', 'drainWaitingQueues', 'expandBlocks', 'directDispatch', 'buildReportText', 'updateConfig', 'GlobalIndicator', 'shell.overlay', 'dsh-mail', 'dedupKeyOf', 'pollEpoch', 'workerMailHint', 'STORAGE_AWAITING', 'acquireSessionFace', 'openSessionById', 'uiWorkspace', 'sessionStatus']) {
     if (client.indexOf(marker) === -1) throw new Error('client missing marker: ' + marker);
   }
   console.log('OK: structural markers present (syntax-only CI mode)');
@@ -94,27 +95,37 @@ async function hostTests() {
   process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-cmdr-test-'));
   const host = await import('file:///' + hostFile.replace(/\\/g, '/'));
   if (host.name !== 'dsh-commander-host') throw new Error('bad host name: ' + host.name);
-  for (const service of ['webServer', 'settings', 'sessions', 'llm']) {
+  for (const service of ['webServer', 'sessions', 'llm']) {
     if (!host.inject.includes(service)) throw new Error('host missing inject: ' + service);
   }
+  if (host.inject.includes('settings')) throw new Error('host must not inject the removed settings service');
+  if (typeof host.Config?.['~standard']?.validate !== 'function') throw new Error('Config is not a Standard Schema (loader config channel)');
+  console.log('OK: host exports name/inject/Config (0.2.0 loader config channel)');
 
   const registeredRoutes = [];
   const appended = [];
   const flushed = [];
-  let namespaceConfig = null;
-  const configPatches = [];
   const sessionsById = new Map();
 
+  /**
+   * 0.2.0 SessionStore mock: the removed `session.events` getter is deliberately
+   * NOT provided — only `snapshotEvents()`, so the old read path would throw.
+   */
   function makeSession(id, events) {
     return {
       id,
-      events,
-      get seq() { return this.events.length; },
+      log: events,
+      snapshotEvents(fromSeq, toSeqExclusive) {
+        const from = fromSeq === undefined ? 0 : fromSeq;
+        const to = toSeqExclusive === undefined ? this.log.length : toSeqExclusive;
+        return this.log.slice(from, to);
+      },
+      get seq() { return this.log.length; },
       header: { cwd: 'D:/proj' },
       append(type, data, opts) {
-        const event = { type, seq: this.events.length + 1, time: 1, data };
+        const event = { type, seq: this.log.length + 1, time: 1, data };
         appended.push({ sessionId: id, type, data, opts });
-        this.events = [...this.events, event];
+        this.log = [...this.log, event];
         return event;
       },
     };
@@ -122,19 +133,6 @@ async function hostTests() {
 
   const ctx = {
     effect(fn) { fn(); },
-    inject(services, cb) {
-      cb({
-      settings: {
-        register: () => ({
-          get: () => namespaceConfig,
-          async update(patch) {
-            configPatches.push(JSON.parse(JSON.stringify(patch)));
-            namespaceConfig = { ...(namespaceConfig ?? {}), ...patch };
-          },
-        }),
-      },
-    });
-    },
     webServer: {
       register(route) { registeredRoutes.push(route); return () => {}; },
     },
@@ -152,6 +150,17 @@ async function hostTests() {
     if (routeByPath[p].kind !== 'exact') throw new Error('wrong kind for ' + p + ': ' + JSON.stringify(routeByPath[p]));
   }
   console.log('OK: host registers the five routes');
+
+  // A disabled mount drives every "enabled=false" gate through `apply(ctx, config)`
+  // — the 0.2.0 config channel (there is no settings namespace to flip at runtime).
+  const disabledRoutes = [];
+  host.apply({
+    effect(fn) { fn(); },
+    webServer: { register(route) { disabledRoutes.push(route); return () => {}; } },
+    sessions: ctx.sessions,
+  }, { enabled: false });
+  const disabledByPath = {};
+  for (const route of disabledRoutes) disabledByPath[route.path] = route;
 
   function fakeRes() {
     let status = 0;
@@ -179,54 +188,86 @@ async function hostTests() {
     };
   }
 
-  // --- config route ---
+  // --- config route (0.2.0: no settings namespace — apply(ctx, config) + panel overrides) ---
+  const configRoute = routeByPath['/api/dsh-commander/config'];
   let f = fakeRes();
-  await routeByPath['/api/dsh-commander/config'].handler({ method: 'GET', url: '/api/dsh-commander/config' }, f.res);
+  await configRoute.handler({ method: 'GET', url: '/api/dsh-commander/config' }, f.res);
   let parsed = f.json();
   if (f.status() !== 200 || parsed.ok !== true || parsed.config.enabled !== true || parsed.config.maxOutstanding !== 5 || parsed.config.pollIntervalMs !== 2000) {
     throw new Error('config defaults wrong: ' + f.body());
   }
-  namespaceConfig = { enabled: false, maxOutstanding: 9 };
   f = fakeRes();
-  await routeByPath['/api/dsh-commander/config'].handler({ method: 'GET', url: '/api/dsh-commander/config' }, f.res);
-  parsed = f.json();
-  if (parsed.config.enabled !== false || parsed.config.maxOutstanding !== 9) throw new Error('config overrides wrong: ' + f.body());
-  namespaceConfig = { enabled: true };
-  f = fakeRes();
-  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', '{oops'), f.res);
+  await configRoute.handler(makeReq('POST', '/api/dsh-commander/config', '{oops'), f.res);
   if (f.status() !== 400) throw new Error('config POST bad JSON must 400: status=' + f.status() + ' body=' + f.body());
   f = fakeRes();
-  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', { noPatch: true }), f.res);
+  await configRoute.handler(makeReq('POST', '/api/dsh-commander/config', { noPatch: true }), f.res);
   if (f.status() !== 400) throw new Error('config POST missing patch must 400: ' + f.body());
   f = fakeRes();
-  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', { patch: { pollIntervalMs: 3000, maxOutstanding: 7, bogus: 'x', autoReport: false } }), f.res);
+  await configRoute.handler(makeReq('POST', '/api/dsh-commander/config', { patch: { pollIntervalMs: 3000, maxOutstanding: 7, bogus: 'x', autoReport: false } }), f.res);
   parsed = f.json();
   if (f.status() !== 200 || parsed.ok !== true) throw new Error('config POST happy wrong: ' + f.status() + ' ' + f.body());
-  if (configPatches.length !== 1) throw new Error('scope.update not called');
-  if (JSON.stringify(configPatches[0]) !== JSON.stringify({ pollIntervalMs: 3000, maxOutstanding: 7, autoReport: false })) {
-    throw new Error('whitelist filter wrong: ' + JSON.stringify(configPatches[0]));
+  if (parsed.config.pollIntervalMs !== 3000 || parsed.config.maxOutstanding !== 7 || parsed.config.autoReport !== false || parsed.config.bogus !== undefined) {
+    throw new Error('whitelist filter wrong: ' + JSON.stringify(parsed.config));
   }
-  if (namespaceConfig.pollIntervalMs !== 3000 || namespaceConfig.autoReport !== false) throw new Error('patch not persisted into namespace');
+  // The write-back lands in the plugin's own override layer, persisted under DSH_HOME.
+  const overrideFile = path.join(process.env.DSH_HOME, 'dsh-commander', 'overrides.json');
+  if (!fs.existsSync(overrideFile)) throw new Error('override layer file missing: ' + overrideFile);
+  const storedOverrides = JSON.parse(fs.readFileSync(overrideFile, 'utf8'));
+  if (storedOverrides.pollIntervalMs?.value !== 3000 || storedOverrides.maxOutstanding?.value !== 7 || storedOverrides.autoReport?.value !== false) {
+    throw new Error('override layer content wrong: ' + JSON.stringify(storedOverrides));
+  }
+  if (storedOverrides.bogus !== undefined) throw new Error('non-whitelisted key leaked into the override layer');
   // Numeric clamps: a rogue patch cannot park the engine with out-of-range values.
   f = fakeRes();
-  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', { patch: { maxOutstanding: 9999, pollIntervalMs: 0 } }), f.res);
-  if (configPatches[configPatches.length - 1].maxOutstanding !== 32 || configPatches[configPatches.length - 1].pollIntervalMs !== 500) {
-    throw new Error('config clamp wrong: ' + JSON.stringify(configPatches[configPatches.length - 1]));
+  await configRoute.handler(makeReq('POST', '/api/dsh-commander/config', { patch: { maxOutstanding: 9999, pollIntervalMs: 0 } }), f.res);
+  parsed = f.json();
+  if (parsed.config.maxOutstanding !== 32 || parsed.config.pollIntervalMs !== 500) {
+    throw new Error('config clamp wrong: ' + JSON.stringify(parsed.config));
+  }
+  // A later profile config edit wins over the stale panel write for the same key.
+  const profileRoutes = [];
+  const profileCtx = {
+    effect(fn) { fn(); },
+    webServer: { register(route) { profileRoutes.push(route); return () => {}; } },
+    sessions: { get() { return undefined; }, flush() { return Promise.resolve(true); } },
+  };
+  host.apply(profileCtx, { maxOutstanding: 11, enabled: true });
+  const profileRoute = profileRoutes.find((r) => r.path === '/api/dsh-commander/config');
+  f = fakeRes();
+  await profileRoute.handler({ method: 'GET', url: '/api/dsh-commander/config' }, f.res);
+  parsed = f.json();
+  if (parsed.config.maxOutstanding !== 11) throw new Error('profile config must win over the stale panel override: ' + f.body());
+  // Keys the profile does NOT pin still come from the override layer.
+  if (parsed.config.pollIntervalMs !== 500 || parsed.config.autoReport !== false) {
+    throw new Error('profile layer must not drop unrelated overrides: ' + JSON.stringify(parsed.config));
+  }
+  // Remounting WITHOUT the profile key restores the panel override (base matches again).
+  const remountRoutes = [];
+  host.apply({
+    effect(fn) { fn(); },
+    webServer: { register(route) { remountRoutes.push(route); return () => {}; } },
+    sessions: { get() { return undefined; }, flush() { return Promise.resolve(true); } },
+  });
+  f = fakeRes();
+  await remountRoutes.find((r) => r.path === '/api/dsh-commander/config').handler({ method: 'GET', url: '/api/dsh-commander/config' }, f.res);
+  parsed = f.json();
+  if (parsed.config.maxOutstanding !== 32 || parsed.config.pollIntervalMs !== 500) {
+    throw new Error('panel overrides must survive a restart when the profile is unchanged: ' + JSON.stringify(parsed.config));
   }
   // CSRF gate: a cross-origin POST must be rejected on every mutating route.
   f = fakeRes();
-  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', { patch: { maxOutstanding: 3 } }, { origin: 'http://evil.example', host: '127.0.0.1:8080' }), f.res);
+  await configRoute.handler(makeReq('POST', '/api/dsh-commander/config', { patch: { maxOutstanding: 3 } }, { origin: 'http://evil.example', host: '127.0.0.1:8080' }), f.res);
   if (f.status() !== 403 || f.json().error.code !== 'cross-origin') throw new Error('config cross-origin must 403: ' + f.body());
   f = fakeRes();
-  await routeByPath['/api/dsh-commander/config'].handler(makeReq('POST', '/api/dsh-commander/config', { patch: { maxOutstanding: 3 } }, { origin: 'http://127.0.0.1:8080', host: '127.0.0.1:8080' }), f.res);
+  await configRoute.handler(makeReq('POST', '/api/dsh-commander/config', { patch: { maxOutstanding: 3 } }, { origin: 'http://127.0.0.1:8080', host: '127.0.0.1:8080' }), f.res);
   if (f.status() !== 200) throw new Error('same-origin POST must pass: ' + f.body());
   f = fakeRes();
   await routeByPath['/api/dsh-commander/inject'].handler(makeReq('POST', '/api/dsh-commander/inject', { sessionId: 'c-1', text: 'x' }, { origin: 'http://evil.example', host: '127.0.0.1:8080' }), f.res);
   if (f.status() !== 403) throw new Error('inject cross-origin must 403');
   f = fakeRes();
-  await routeByPath['/api/dsh-commander/config'].handler({ method: 'PATCH', url: '/api/dsh-commander/config' }, f.res);
+  await configRoute.handler({ method: 'PATCH', url: '/api/dsh-commander/config' }, f.res);
   if (f.status() !== 405) throw new Error('config PATCH must 405: status=' + f.status());
-  console.log('OK: host config route (read / whitelist write-back / validation / 405)');
+  console.log('OK: host config route (defaults / whitelist+clamp write-back / override layer / 405)');
 
   // --- inject route ---
   const injectRoute = routeByPath['/api/dsh-commander/inject'];
@@ -251,11 +292,9 @@ async function hostTests() {
   await injectRoute.handler(makeReq('POST', '/api/dsh-commander/inject', { sessionId: 'busy', text: 'x' }), f.res);
   if (f.status() !== 409 || f.json().error.code !== 'busy') throw new Error('inject busy wrong');
 
-  namespaceConfig = { enabled: false };
   f = fakeRes();
-  await injectRoute.handler(makeReq('POST', '/api/dsh-commander/inject', { sessionId: 'c-1', text: 'x' }), f.res);
+  await disabledByPath['/api/dsh-commander/inject'].handler(makeReq('POST', '/api/dsh-commander/inject', { sessionId: 'c-1', text: 'x' }), f.res);
   if (f.status() !== 200 || f.json().ok !== false || f.json().error.code !== 'disabled') throw new Error('inject disabled wrong');
-  namespaceConfig = null;
 
   sessionsById.set('big', makeSession('big', []));
   f = fakeRes();
@@ -270,7 +309,8 @@ async function hostTests() {
   const injection = appended[appended.length - 1];
   if (injection.type !== 'user/message') throw new Error('append must be user/message');
   if (injection.opts?.surfaceOp !== 'append') throw new Error('append surfaceOp wrong');
-  if (JSON.stringify(injection.data).indexOf('dsh-commander') === -1) throw new Error('append must carry plugin source');
+  // 0.2.0 message vocabulary has no catch-all `plugin` kind: the plugin names itself.
+  if (injection.data?.source?.kind !== 'dsh-commander') throw new Error('append must carry the dsh-commander source kind: ' + JSON.stringify(injection.data?.source));
   if (JSON.stringify(injection.data).indexOf('简报内容') === -1) throw new Error('append must carry briefing text');
   if (!flushed.includes('c-1')) throw new Error('inject must flush the session');
   console.log('OK: host inject route (validation matrix + silent checkpoint append + flush)');
@@ -289,6 +329,8 @@ async function hostTests() {
     { type: 'tool/call', seq: 9, time: 9, data: { turn: 3, step: 0, callId: 'c1', name: 'write', arguments: '{"file_path":"src/a.ts","content":"x"}' } },
     { type: 'tool/call', seq: 10, time: 10, data: { turn: 3, step: 1, callId: 'c2', name: 'edit', arguments: '{"filePath":"docs/b.md","old_string":"a","new_string":"b"}' } },
     { type: 'tool/call', seq: 11, time: 11, data: { turn: 3, step: 2, callId: 'c3', name: 'read', arguments: '{"file_path":"ignored.ts"}' } },
+    // 0.2.0 source kind written by the current host half — also NOT human input.
+    { type: 'user/message', seq: 12, time: 12, data: { source: { kind: 'dsh-commander' }, content: [] } },
   ];
   sessionsById.set('log', makeSession('log', logEvents));
 
@@ -312,11 +354,9 @@ async function hostTests() {
   await eventsRoute.handler({ method: 'POST', url: '/api/dsh-commander/events' }, f.res);
   if (f.status() !== 405) throw new Error('events POST must 405');
 
-  namespaceConfig = { enabled: false };
   f = fakeRes();
-  await eventsRoute.handler({ method: 'GET', url: '/api/dsh-commander/events?sessionId=log' }, f.res);
+  await disabledByPath['/api/dsh-commander/events'].handler({ method: 'GET', url: '/api/dsh-commander/events?sessionId=log' }, f.res);
   if (f.status() !== 200 || f.json().ok !== false || f.json().error.code !== 'disabled') throw new Error('events disabled wrong');
-  namespaceConfig = null;
 
   f = fakeRes();
   await eventsRoute.handler({ method: 'GET', url: '/api/dsh-commander/events?sessionId=log&cursor=3&limit=10' }, f.res);
@@ -325,9 +365,11 @@ async function hostTests() {
   if (parsed.events.length !== 1 || parsed.events[0].seq !== 5 || parsed.events[0].text !== '新输出A' || parsed.events[0].turn !== 2) {
     throw new Error('events tail projection wrong: ' + JSON.stringify(parsed.events));
   }
-  if (parsed.lastSeq !== 11 || parsed.lastAssistantSeq !== 5) throw new Error('events anchors wrong: ' + JSON.stringify(parsed));
+  if (parsed.lastSeq !== 12 || parsed.lastAssistantSeq !== 5) throw new Error('events anchors wrong: ' + JSON.stringify(parsed));
   if (parsed.lastEnd?.reason !== 'error' || parsed.lastEnd?.turn !== 2) throw new Error('events lastEnd wrong');
-  // One HUMAN user message after cursor=3 (seq7); the plugin-sourced one (seq8) must not count.
+  // One HUMAN user message after cursor=3 (seq7); BOTH plugin-sourced ones —
+  // the legacy `plugin` kind (seq8) and the 0.2.0 `dsh-commander` kind (seq12) —
+  // must not count as human input.
   if (parsed.humanMessages !== 1) throw new Error('events humanMessages wrong: ' + parsed.humanMessages);
   // Artifacts: write+edit extracted, read ignored; per-tool counts reported.
   if (!Array.isArray(parsed.files) || parsed.files.length !== 2 || parsed.files[0].path !== 'src/a.ts' || parsed.files[1].path !== 'docs/b.md') {
@@ -444,11 +486,9 @@ async function hostTests() {
   f = fakeRes();
   await mailRoute.handler(makeReq('POST', '/api/dsh-commander/mail', { from: 'w-1', to: ['w-2'], body: 'x'.repeat(8 * 1024 + 1) }), f.res);
   if (f.status() !== 413) throw new Error('mail oversized body must 413');
-  namespaceConfig = { enabled: false };
   f = fakeRes();
-  await mailRoute.handler(makeReq('POST', '/api/dsh-commander/mail', { from: 'w-1', to: ['w-2'], body: 'x' }), f.res);
+  await disabledByPath['/api/dsh-commander/mail'].handler(makeReq('POST', '/api/dsh-commander/mail', { from: 'w-1', to: ['w-2'], body: 'x' }), f.res);
   if (f.status() !== 200 || f.json().ok !== false || f.json().error.code !== 'disabled') throw new Error('mail disabled gate wrong');
-  namespaceConfig = null;
   f = fakeRes();
   await mailRoute.handler(makeReq('POST', '/api/dsh-commander/mail', { from: 'w-1', to: ['w-2'], body: 'x' }, { origin: 'http://evil.example', host: '127.0.0.1:8080' }), f.res);
   if (f.status() !== 403) throw new Error('mail cross-origin must 403');
@@ -463,11 +503,9 @@ async function hostTests() {
   f = fakeRes();
   await gitRoute.handler(makeReq('POST', '/api/dsh-commander/git', { op: 'nope' }), f.res);
   if (f.status() !== 400) throw new Error('git unknown op must 400: ' + f.body());
-  namespaceConfig = { enabled: false };
   f = fakeRes();
-  await gitRoute.handler(makeReq('POST', '/api/dsh-commander/git', { op: 'nope' }), f.res);
+  await disabledByPath['/api/dsh-commander/git'].handler(makeReq('POST', '/api/dsh-commander/git', { op: 'nope' }), f.res);
   if (f.status() !== 200 || f.json().ok !== false || f.json().error.code !== 'disabled') throw new Error('git disabled gate wrong: ' + f.body());
-  namespaceConfig = null;
   console.log('OK: git route (method/unknown-op/disabled gating)');
 
   // --- roundtable route (two-round debate over the injected llm service) ---
@@ -480,33 +518,31 @@ async function hostTests() {
   await rtRoute.handler(makeReq('POST', '/api/dsh-commander/roundtable', { topic: '', body: 'x' }), f.res);
   if (f.status() !== 400) throw new Error('roundtable missing topic must 400');
   let llmCalls = 0;
+  const llmOptions = [];
   const llmMock = {
     async *stream(options) {
       llmCalls += 1;
+      llmOptions.push(options);
       const text = JSON.stringify(options.messages?.[0]?.content ?? '').includes('第二轮') ? '第二轮结论' + String(llmCalls) : '第一轮观点' + String(llmCalls);
       yield { type: 'block-start', index: 0, blockType: 'text' };
       yield { type: 'text-delta', index: 0, text };
     },
+    listProviders() { return [{ provider: 'deepseek', name: 'DeepSeek' }]; },
+    async listModels(provider) { return provider === 'deepseek' ? [{ id: 'deepseek-chat' }] : []; },
   };
   // The routes registered above closed over the ORIGINAL ctx object — rebuild
-  // the route handler by re-applying with an llm-bearing context.
+  // the route handler by re-applying with an llm-bearing context. 0.2.0's
+  // GenerateOptions REQUIRES provider+model, resolved from (1) the request body,
+  // (2) agentDefaultModel, (3) the first registered provider route.
   const rtRoutes = [];
-  host.apply({
+  const rtCtx = {
     effect(fn) { fn(); },
-    inject(services, cb) {
-      cb({
-        settings: {
-          register: () => ({
-            get: () => ({ enabled: true }),
-            async update() {},
-          }),
-        },
-      });
-    },
     webServer: { register(route) { rtRoutes.push(route); } },
     sessions: { get() { return undefined; }, flush() {} },
     llm: llmMock,
-  });
+    get(name) { return name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-reasoner' }) } : undefined; },
+  };
+  host.apply(rtCtx, { enabled: true });
   const rtRoute2 = rtRoutes.find((r) => r.path === '/api/dsh-commander/roundtable');
   f = fakeRes();
   await rtRoute2.handler(makeReq('POST', '/api/dsh-commander/roundtable', { topic: '方案', body: '背景材料', count: 3 }), f.res);
@@ -517,7 +553,48 @@ async function hostTests() {
   if (parsed.minutes.indexOf('第一轮观点') === -1 || parsed.minutes.indexOf('第二轮结论') === -1 || parsed.minutes.indexOf('圆桌纪要') === -1) {
     throw new Error('roundtable minutes wrong: ' + parsed.minutes.slice(0, 200));
   }
-  console.log('OK: roundtable route (two-round debate, 6 parallel llm calls, minutes assembled)');
+  // Every call must carry the resolved route + the plugin source kind.
+  for (const options of llmOptions) {
+    if (options.provider !== 'deepseek' || options.model !== 'deepseek-reasoner') {
+      throw new Error('roundtable must resolve provider/model from agentDefaultModel: ' + JSON.stringify({ provider: options.provider, model: options.model }));
+    }
+    if (options.messages?.[0]?.source?.kind !== 'dsh-commander') throw new Error('roundtable messages must carry the plugin source kind');
+  }
+  // Explicit body fields win over the default selection.
+  f = fakeRes();
+  await rtRoute2.handler(makeReq('POST', '/api/dsh-commander/roundtable', { topic: '方案', body: '背景材料', count: 3, provider: 'other', model: 'other-model' }), f.res);
+  if (f.status() !== 200) throw new Error('roundtable explicit route wrong: ' + f.body());
+  if (llmOptions[llmOptions.length - 1].provider !== 'other' || llmOptions[llmOptions.length - 1].model !== 'other-model') {
+    throw new Error('explicit provider/model must win: ' + JSON.stringify(llmOptions[llmOptions.length - 1]));
+  }
+  // Without a default selection the first registered route + its first model is used.
+  const bareRoutes = [];
+  host.apply({
+    effect(fn) { fn(); },
+    webServer: { register(route) { bareRoutes.push(route); } },
+    sessions: { get() { return undefined; }, flush() {} },
+    llm: llmMock,
+    get() { return undefined; },
+  }, { enabled: true });
+  f = fakeRes();
+  await bareRoutes.find((r) => r.path === '/api/dsh-commander/roundtable').handler(makeReq('POST', '/api/dsh-commander/roundtable', { topic: '方案', body: '背景材料', count: 3 }), f.res);
+  if (f.status() !== 200) throw new Error('roundtable fallback route wrong: ' + f.body());
+  if (llmOptions[llmOptions.length - 1].provider !== 'deepseek' || llmOptions[llmOptions.length - 1].model !== 'deepseek-chat') {
+    throw new Error('first registered route must back the fallback: ' + JSON.stringify(llmOptions[llmOptions.length - 1]));
+  }
+  // No route at all -> fail closed instead of guessing a model id.
+  const noRouteRoutes = [];
+  host.apply({
+    effect(fn) { fn(); },
+    webServer: { register(route) { noRouteRoutes.push(route); } },
+    sessions: { get() { return undefined; }, flush() {} },
+    llm: { async *stream() {}, listProviders() { return []; } },
+    get() { return undefined; },
+  }, { enabled: true });
+  f = fakeRes();
+  await noRouteRoutes.find((r) => r.path === '/api/dsh-commander/roundtable').handler(makeReq('POST', '/api/dsh-commander/roundtable', { topic: '方案', body: '背景材料', count: 3 }), f.res);
+  if (f.status() !== 503 || f.json().error.code !== 'no-model-route') throw new Error('roundtable without any route must fail closed: ' + f.status() + ' ' + f.body());
+  console.log('OK: roundtable route (two-round debate, 6 parallel llm calls, 0.2.0 provider/model resolution)');
 }
 
 // --- 3. client bundle tests ---
@@ -535,8 +612,9 @@ async function clientTests() {
 
   // Fetch mock routing by URL; per-session event handlers respect the cursor
   // so repeated polls are idempotent exactly like the real host route.
-  const calls = { inject: [], prompts: [], renames: [], createOpts: [], cancels: [], forkOpts: [], registryPosts: [] };
+  const calls = { inject: [], prompts: [], renames: [], createOpts: [], cancels: [], forkOpts: [], registryPosts: [], retains: [], releases: [], opens: [], approvals: [] };
   let configPayload = { ok: true, config: { enabled: true } };
+  let configFetches = 0;
   const eventHandlers = {};
 
   function jsonResponse(payload) {
@@ -545,7 +623,10 @@ async function clientTests() {
 
   global.fetch = async (url, opts) => {
     const u = String(url);
-    if (u.includes('/api/dsh-commander/config')) return jsonResponse(configPayload);
+    if (u.includes('/api/dsh-commander/config')) {
+      configFetches += 1;
+      return jsonResponse(configPayload);
+    }
     if (u.includes('/api/dsh-commander/registry')) {
       if ((opts?.method ?? 'GET') === 'POST') {
         calls.registryPosts.push(JSON.parse(opts.body));
@@ -568,7 +649,11 @@ async function clientTests() {
     throw new Error('unexpected fetch ' + u);
   };
 
-  // Sessions runtime mock: list snapshot store + lazy bindings + create().
+  // --- 0.2.0 sessions runtime mock ---
+  // `binding(id)` answers ONLY for a currently retained generation (exactly the
+  // 0.2.0 contract), so every prompt path must go through retain → ready →
+  // binding.session → release. `retained` counts the live references to prove
+  // the engine never leaks one.
   const listSnapshot = {
     ids: ['c-1', 'w-1', 'w-2', 'blank', 'c-2'],
     byId: {
@@ -579,8 +664,10 @@ async function clientTests() {
       'c-2': { id: 'c-2', displayTitle: '指挥官二号', title: '', cwd: 'D:/proj2', running: false, completed: false, blank: false },
     },
     current: 'c-1',
+    phase: 'ready',
   };
   const faces = {};
+  const retained = new Map(); // sessionId -> live reference count
   function addFace(id) {
     faces[id] = {
       sessionId: id,
@@ -593,9 +680,50 @@ async function clientTests() {
   addFace('c-1');
   addFace('w-1');
   addFace('w-2');
+  let referenceCounter = 0;
   const sessionsMock = {
     list: { getSnapshot: () => listSnapshot, subscribe() { return () => {}; } },
-    binding(id) { return faces[id] !== undefined ? { sessionId: id, session: faces[id] } : undefined; },
+    binding(id) {
+      if ((retained.get(id) | 0) <= 0) return undefined; // not retained -> no binding (0.2.0)
+      const face = faces[id];
+      return face === undefined ? undefined : { sessionId: id, session: face };
+    },
+    retain(id, options) {
+      calls.retains.push({ id, source: options?.source });
+      const referenceId = ++referenceCounter;
+      let live = true;
+      retained.set(id, (retained.get(id) | 0) + 1);
+      const reference = {
+        sessionId: id,
+        get binding() {
+          const face = faces[id];
+          return face === undefined ? undefined : { sessionId: id, session: face };
+        },
+        // 0.2.0: `ready` is the cancellable wait for the shared initial open.
+        ready: Promise.resolve().then(() => {
+          if (faces[id] === undefined) throw new Error('session open failed: ' + id);
+          return { sessionId: id, session: faces[id] };
+        }),
+        release() {
+          if (!live) return;
+          live = false;
+          calls.releases.push({ id, referenceId });
+          const next = (retained.get(id) | 0) - 1;
+          if (next <= 0) retained.delete(id);
+          else retained.set(id, next);
+        },
+      };
+      return reference;
+    },
+    async using(id, options, operation) {
+      const reference = sessionsMock.retain(id, options);
+      try {
+        await reference.ready;
+        return await operation(reference);
+      } finally {
+        reference.release();
+      }
+    },
     async create(opts) {
       calls.createOpts.push(opts);
       listSnapshot.ids.push('session-new');
@@ -603,8 +731,20 @@ async function clientTests() {
       addFace('session-new');
       return 'session-new';
     },
-    open() {},
     refresh: async () => {},
+  };
+
+  // 0.2.0 session status + navigation services (read through ctx.get).
+  const statusMap = new Map();
+  const uiSessionMock = { sessionStatus: { getSnapshot: () => statusMap, subscribe() { return () => {}; } } };
+  const uiWorkspaceMock = {
+    openSession(id) { calls.opens.push(id); },
+  };
+  // The host-forwarded settings broadcast: 0.2.0 payloads carry the PROFILE ENTRY
+  // id (`ui-dsh-commander`), not a settings namespace.
+  const remoteHandlers = {};
+  const remoteMock = {
+    $on(event, handler) { remoteHandlers[event] = handler; return () => { delete remoteHandlers[event]; }; },
   };
 
   const loader = {};
@@ -630,13 +770,20 @@ async function clientTests() {
   if (client.inject.length !== 3 || client.inject[0] !== 'slots' || client.inject[1] !== 'sessions' || client.inject[2] !== 'remote') {
     throw new Error('wrong client inject: ' + JSON.stringify(client.inject));
   }
+  if (client.SESSION_SOURCE !== 'commander') throw new Error('wrong retain source label: ' + client.SESSION_SOURCE);
   console.log('OK: client bundle loads, inject slots+sessions+remote');
 
   // --- registration via apply() ---
   const entries = [];
   const injectedSeats = [];
   const ctx = {
-    get(name) { return name === 'sessions' ? sessionsMock : undefined; },
+    remote: remoteMock,
+    get(name) {
+      if (name === 'sessions') return sessionsMock;
+      if (name === 'uiSession') return uiSessionMock;
+      if (name === 'uiWorkspace') return uiWorkspaceMock;
+      return undefined;
+    },
     slots: {
       inject(name, factory) { injectedSeats.push(name); factory(); },
       register(opts, component) { entries.push({ opts, component }); return () => {}; },
@@ -657,6 +804,22 @@ async function clientTests() {
   }
   if (client.state.booted !== true) throw new Error('engine not booted by apply()');
   console.log('OK: client registers both seats and boots the engine');
+
+  // --- 0.2.0 navigation (uiWorkspace.openSession instead of the removed sessions.open) ---
+  client.openSessionById('w-1');
+  if (!calls.opens.includes('w-1')) throw new Error('openSessionById must navigate through uiWorkspace.openSession');
+  client.openSessionById('');
+  if (calls.opens.length !== 1) throw new Error('empty session id must not navigate');
+  // --- profile-entry settings broadcast re-reads the config ---
+  if (typeof remoteHandlers['settings/document-updated'] !== 'function') throw new Error('settings/document-updated listener not registered');
+  const configFetchesBefore = configFetches;
+  remoteHandlers['settings/document-updated']('ui-dsh-commander');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  if (configFetches !== configFetchesBefore + 1) throw new Error('profile entry config edit must re-read /config (fetches=' + String(configFetches) + ')');
+  remoteHandlers['settings/document-updated']('some-other-entry');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  if (configFetches !== configFetchesBefore + 1) throw new Error('an unrelated entry must not re-read /config');
+  console.log('OK: uiWorkspace navigation + profile-entry config broadcast');
 
   // --- protocol parsing ---
   let blocks = client.parseDispatchBlocks('');
@@ -1037,15 +1200,24 @@ async function clientTests() {
   await client.poll();
   const takeoverTask = [...client.state.tasks.values()].find((t) => t.excerpt === '做D');
   if (takeoverTask === undefined || takeoverTask.status !== 'running') throw new Error('takeover setup wrong');
-  // Worker asks for a permission confirmation -> panel must flag it.
-  listSnapshot.byId['w-2'].pendingInteraction = { kind: 'permission' };
+  // Worker asks for a permission confirmation -> panel must flag it. 0.2.0 keeps
+  // pending interactions in uiSession.sessionStatus (a PendingApproval object),
+  // not on the list row.
+  statusMap.set('w-2', { running: true, pendingInteraction: { kind: 'approval', toolName: 'pwsh', answerable: true, answer: async (outcome) => { calls.approvals.push(outcome); } } });
   await client.poll();
   if (takeoverTask.stuck !== true) throw new Error('stuck flag not set');
+  // Panel one-click approval answers through PendingApproval.answer().
+  await client.respondApproval(takeoverTask.id, 'approved');
+  if (calls.approvals[0] !== 'allowed-once') throw new Error('panel approval must answer allowed-once: ' + JSON.stringify(calls.approvals));
+  // Legacy hosts still expose pendingInteraction on the list row — recognized as a fallback.
+  listSnapshot.byId['w-1'].pendingInteraction = { kind: 'approval' };
+  if (client.pendingInteractionOf('w-1')?.kind !== 'approval') throw new Error('legacy row pendingInteraction fallback broken');
+  delete listSnapshot.byId['w-1'].pendingInteraction;
   // The human answers IN the worker session instead: takeover, no receipt.
   // (takeoverOnHuman defaults to false — human chatter must NOT kill tasks —
   //  so this scenario explicitly opts into the legacy takeover semantics.)
   client.state.config.takeoverOnHuman = true;
-  listSnapshot.byId['w-2'].pendingInteraction = null;
+  statusMap.delete('w-2');
   listSnapshot.byId['w-2'].running = false;
   takeoverTask.sentAt = Date.now() - 10000;
   w2Events = []; // no assistant output of ours got processed before the human stepped in
@@ -1121,6 +1293,19 @@ async function clientTests() {
   if (!calls.registryPosts.some((p) => p.sessionId === 'c-1' && p.active === true)) throw new Error('registry add post missing');
   if (!calls.registryPosts.some((p) => p.sessionId === 'c-1' && p.active === false)) throw new Error('registry remove post missing');
   console.log('OK: deactivation clears the commander and syncs the durable registry');
+
+  // --- 0.2.0 session references: retained on demand, released, never leaked ---
+  for (const id of ['w-1', 'w-2', 'session-new', 'c-1']) {
+    if (!calls.retains.some((row) => row.id === id)) throw new Error('engine never retained ' + id + ' (0.2.0 binding needs a retained generation)');
+  }
+  if (!calls.retains.every((row) => row.source === 'commander')) {
+    throw new Error('every retain must carry the commander source label: ' + JSON.stringify(calls.retains.find((row) => row.source !== 'commander')));
+  }
+  if (calls.releases.length !== calls.retains.length) {
+    throw new Error('retain/release imbalance: ' + String(calls.retains.length) + ' retains vs ' + String(calls.releases.length) + ' releases');
+  }
+  if (retained.size !== 0) throw new Error('session references leaked: ' + JSON.stringify([...retained.entries()]));
+  console.log('OK: every prompt path retains a generation and releases it (no leaked references)');
 
   // --- SSR: inactive button vs active badge + panel + global pill ---
   const serverRenderer = require(reactDomServerPath);

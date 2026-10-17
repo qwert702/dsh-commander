@@ -112,9 +112,34 @@ global.fetch = async (url, opts) => {
   throw new Error('unexpected fetch ' + u);
 };
 
+// 0.2.0 sessions runtime: `binding()` only answers for a RETAINED generation, so
+// every engine prompt path goes through retain → ready → binding.session → release.
+const retained = new Map();
 const sessionsMock = {
   list: { getSnapshot: () => listSnapshot, subscribe() { return () => {}; } },
-  binding(id) { return faces[id] ? { sessionId: id, session: faces[id] } : undefined; },
+  binding(id) {
+    if ((retained.get(id) | 0) <= 0) return undefined;
+    return faces[id] ? { sessionId: id, session: faces[id] } : undefined;
+  },
+  retain(id) {
+    retained.set(id, (retained.get(id) | 0) + 1);
+    let live = true;
+    return {
+      sessionId: id,
+      get binding() { return faces[id] ? { sessionId: id, session: faces[id] } : undefined; },
+      ready: Promise.resolve().then(() => {
+        if (faces[id] === undefined) throw new Error('session open failed: ' + id);
+        return { sessionId: id, session: faces[id] };
+      }),
+      release() {
+        if (!live) return;
+        live = false;
+        const next = (retained.get(id) | 0) - 1;
+        if (next <= 0) retained.delete(id);
+        else retained.set(id, next);
+      },
+    };
+  },
   async create(opts) {
     soakCreateCounter += 1;
     const id = 'new-' + String(soakCreateCounter);
@@ -123,8 +148,11 @@ const sessionsMock = {
     faces[id] = { sessionId: id, async prompt() { return { ok: true }; }, async rename() { return { ok: true }; }, async cancel() { return { ok: true }; } };
     return id;
   },
-  open() {},
 };
+// 0.2.0 pending interactions live on uiSession.sessionStatus, not on the list row.
+const soakStatus = new Map();
+const uiSessionMock = { sessionStatus: { getSnapshot: () => soakStatus, subscribe() { return () => {}; } } };
+const uisWorkspaceMock = { openSession() {} };
 
 const loader = {};
 global.window = {
@@ -142,7 +170,12 @@ global.window = {
 const client = loader.exports;
 
 client.apply({
-  get(name) { return name === 'sessions' ? sessionsMock : undefined; },
+  get(name) {
+    if (name === 'sessions') return sessionsMock;
+    if (name === 'uiSession') return uiSessionMock;
+    if (name === 'uiWorkspace') return uisWorkspaceMock;
+    return undefined;
+  },
   slots: { inject(n, f) { f(); }, register(o, comp) { return () => {}; } },
 });
 
@@ -171,6 +204,8 @@ function checkInvariants(tag) {
     assert(prev === undefined || record.cursor >= prev, tag + ': cursor regressed for ' + commanderId);
     cursorSeen.set(commanderId, record.cursor);
   }
+  // 0.2.0 references are held only for the duration of one operation.
+  assert(retained.size === 0, tag + ': leaked session references ' + JSON.stringify([...retained.entries()]));
 }
 
 (async () => {
@@ -192,8 +227,8 @@ function checkInvariants(tag) {
     }
     for (const w of ['w-1', 'w-2', 'w-3']) {
       if (chance(0.5)) listSnapshot.byId[w].running = chance(0.5);
-      if (chance(0.08)) listSnapshot.byId[w].pendingInteraction = { kind: 'approval' };
-      else delete listSnapshot.byId[w].pendingInteraction;
+      if (chance(0.08)) soakStatus.set(w, { running: true, pendingInteraction: { kind: 'approval', answerable: true } });
+      else soakStatus.delete(w);
     }
     await client.poll();
     if (process.env.SOAK_DEBUG && cycle <= 2) {
@@ -214,7 +249,7 @@ function checkInvariants(tag) {
     checkInvariants('cycle ' + cycle);
   }
   // Quiesce: free every worker and drain until nothing is active (bounded).
-  for (const w of ['w-1', 'w-2', 'w-3']) { listSnapshot.byId[w].running = false; delete listSnapshot.byId[w].pendingInteraction; }
+  for (const w of ['w-1', 'w-2', 'w-3']) { listSnapshot.byId[w].running = false; soakStatus.delete(w); }
   for (let i = 0; i < 15; i++) {
     for (const t of client.state.tasks.values()) {
       if (!TERMINAL.has(t.status) && t.status !== 'sending') t.sentAt = Date.now() - 60000;

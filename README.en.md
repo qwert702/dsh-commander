@@ -1,4 +1,4 @@
-# dsh-commander (v2.1, harness >= 0.1.6)
+# dsh-commander (v2.2, harness 0.2.0-rc.2)
 
 Multi-conversation orchestration for the DeepSeek Harness Web GUI: promote any
 conversation to **commander**, and its model can dispatch tasks to other
@@ -12,6 +12,17 @@ closed, supervised delegation loop.
 > ```
 > Restart `dsh web` and refresh the page. A 「成为指挥官」(Become commander)
 > button appears in every conversation header. UI copy is Chinese-first.
+
+> **v2.2 adapts to harness 0.2.0-rc.2.** The removed `settings.register()`
+> namespace is replaced by the exported `Config` schema applied through
+> `apply(ctx, config)`; session logs are read through `session.snapshotEvents()`;
+> browser-side session access goes through
+> `retain → await reference.ready → reference.binding.session → release()`
+> (0.2.0 `binding()` only answers for retained generations); navigation uses
+> `uiWorkspace.openSession()`; pending interactions are read from
+> `uiSession.sessionStatus`; plugin messages carry their own `dsh-commander`
+> source kind; and the roundtable route resolves an exact provider/model route
+> for 0.2.0's required `GenerateOptions`.
 
 ## Highlights
 
@@ -50,31 +61,39 @@ closed, supervised delegation loop.
   fetches the complete output on demand.
 
 - **Persistence** — activations live in a durable host registry
-  (`~/.dsh/dsh-commander/registry.json`) plus localStorage: commanders survive
-  harness restarts and port changes. Queued/dependency-gated tasks are
+  (`<dsh-home>/dsh-commander/registry.json`) plus localStorage: commanders
+  survive harness restarts and port changes. Queued/dependency-gated tasks are
   reconciled after reload against what settled while the page was away. A
   failed tail-anchor probe refuses to restore rather than guessing cursor 0,
   so history can never be replayed as fresh dispatches.
 
 - **Two settings surfaces** — dsh's native settings panel gains a 指挥官 page
   (including per-project task statistics and totals), and the conversation
-  panel has an inline 设置 drawer. Both write through to
-  `~/.dsh/settings.yaml` and take effect immediately.
+  panel has an inline 设置 drawer. Both write through the plugin's own persisted
+  override layer (`<dsh-home>/dsh-commander/overrides.json`) and take effect
+  immediately; the profile entry's `config` stays the base layer and any later
+  edit there wins over a stale panel write.
 
 - **Safety rails** — burst caps (concurrent / per-message / per-activation /
   auto-created-per-batch), cross-commander hop budget, optional
   confirm-before-dispatch mode, one-click approve/deny for worker permission
-  prompts (toggleable), desktop notifications while tabbed away.
+  prompts (toggleable), desktop notifications while tabbed away, origin-checked
+  mutating routes, and range-clamped config write-back.
 
 ## How it works
 
-The host half registers five routes (config read/write-back, silent briefing
-injection, event-log projection with human-message counting and artifact
-extraction, full-result fetch, durable registry). The browser half runs a
-module-level engine singleton that polls the projected tails, expands and gates
-parsed batches through a pure policy function, delivers prompts via the client
-sessions runtime, watches workers through the shared list snapshot, and feeds
-receipts back into the commander. Three additive seats render the header badge +
-panel, the global indicator pill, and the native settings section.
+The host half exports `Config` (validated by the loader and handed to
+`apply(ctx, config)`), injects `webServer` + `sessions` + `llm`, and registers
+eight routes: config read/write-back, silent briefing injection, event-log
+projection (`session.snapshotEvents()`) with human-message counting and artifact
+extraction, full-result fetch, durable registry, worker mailbox, git worktree
+ops, and the roundtable debate. The browser half runs a module-level engine
+singleton that polls the projected tails, expands and gates parsed batches
+through a pure policy function, delivers prompts through the client sessions
+runtime — holding a short-lived `retain` reference per operation — watches
+workers through the shared list snapshot, reads pending interactions from
+`uiSession`, navigates with `uiWorkspace.openSession`, and feeds receipts back
+into the commander. Three additive seats render the header badge + panel, the
+global indicator pill, and the native settings section.
 
 See [README.md](README.md) for the full Chinese documentation.

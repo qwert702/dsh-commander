@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.2.0 — 2026-10-17
+
+### 适配 harness 0.2.0-rc.2
+
+- **配置通道迁移**：删除 `ctx.inject(['settings'])` + `settings.register('dsh-commander', SCHEMA)`（0.2.0 已移除该 API），改为导出 `Config = SCHEMA`，由 loader 校验 profile 条目 `ui-dsh-commander` 的 `config` 后经 `apply(ctx, config)` 传入；`inject` 收敛为 `['webServer', 'sessions', 'llm']`。
+- **面板写回改为插件自有覆盖层**：`POST /api/dsh-commander/config` 不再写设置命名空间，而是白名单 + 区间钳制后写入 `<dsh-home>/dsh-commander/overrides.json`（原子写）。每项记录写入时的 profile 基准值：`cordis.patch.yml` 事后改同一键时 profile 立即胜出，过期覆盖自动失效；删除该文件即回到 profile 配置。
+- **会话日志读取迁移**：`session.events` 在 0.2.0 已删除，`hasOpenTurn` / `projectAssistantTail` 改用 `session.snapshotEvents()`（旧属性仅作兜底）。
+- **消息 source 迁移**：0.2.0 的消息来源没有通用 `plugin` kind，简报注入改为 `{ kind: 'dsh-commander' }`；真人消息计数同时把新 kind 与旧 `plugin` kind 视为插件消息（不误判为人工接管）。
+- **圆桌讨论对齐 `GenerateOptions`**：0.2.0 必填 `provider`/`model`。解析顺序为「请求体 → `agentDefaultModel` → 首个已注册 provider 路由（含 `listModels` 首项）」，都解析不到时返回 503 `no-model-route`，不再把缺省路由交给适配器；调用同时带上 `AbortSignal` 超时。
+- **客户端会话访问改为引用生命周期**：0.2.0 的 `sessions.binding(id)` 只对已 retain 的会话有效。新增 `acquireSessionFace` / `withSessionFace`：已绑定则直接使用，否则 `retain(id, { source: 'commander' })` → `await reference.ready` → `reference.binding.session` → `release()`。投递、改名（fork/新建 worker）、续跑、取消、回执、批次汇总、观察推送、邮箱投递全部改走该路径；负载均衡与 failover 的「可达性」判定改用列表行，不再把「未 retain」误判为不可达。
+- **导航迁移**：`sessions.open()` 已删除，跳转改用 `ctx.get('uiWorkspace').openSession(id)`（面板「打开」与全局指示器）。
+- **待应答交互迁移**：列表行不再有 `pendingInteraction`，改为读 `uiSession.sessionStatus` 的 `pendingInteraction`；面板一键审批改调 0.2.0 的 `PendingApproval.answer('allowed-once' | 'rejected')`，旧快照 `pending` 数组保留兜底。
+- **`settings/document-updated` 对齐**：0.2.0 广播携带 profile 条目 id（`ui-dsh-commander`），不再比较旧命名空间名。
+- **`package.json`**：`dsh.client.inject` 移除已删除的 `@deepseek-ai/dsh-client-runtime`，改列属主包（gateway / api-session-controller / ui-session / ui-conversation / ui-layout / ui-settings / ui-workspace / locale）；描述与版本 2.1.0 → 2.2.0。
+- **测试跟进**：`test/smoke.cjs` 的 host 段不再 mock `settings.register`，改为 `apply(ctx, config)` 驱动 + 覆盖层文件断言 + `snapshotEvents()` 专用会话 mock + 圆桌路由解析矩阵；client 段重写 sessions mock（binding 仅对已 retain 生效、retain/ready/release 计数、uiSession、uiWorkspace），新增「无引用泄漏」「导航」「配置广播」「审批一键应答」断言，原有断言全部保留。`test/soak.cjs` 同步新契约并新增「回合之间无残留会话引用」不变量。
+
 ## 2.1.0 — 2026-09-19
 
 ### 适配 harness ≥ 0.1.6
